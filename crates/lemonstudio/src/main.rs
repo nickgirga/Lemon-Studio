@@ -653,7 +653,10 @@ impl Shell {
         self.pending |= self.app.tick();
         self.sync_detached(el);
         #[cfg(target_os = "linux")]
-        self.osk_sync(self.app.auto_close.main_focused && self.app.text_input_active());
+        {
+            self.osk_sync(self.app.auto_close.main_focused && self.app.text_input_active());
+            self.app.state.osk = self.osk.activated;
+        }
         // The startup splash: the opened project's loading moves its gauge on; once the main window has shown and
         // nothing is loading, it finishes. It is dropped when it has faded away.
         if let Some(s) = &self.splash {

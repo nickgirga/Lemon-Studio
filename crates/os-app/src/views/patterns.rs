@@ -80,7 +80,7 @@ pub fn paint(ui: &mut Ui, s: &State) {
     let lemon = super::lemon(ui);
     let rb = if lemon { 5.0 } else { 2.0 };
     if let Some(b) = s.pat_ui.name_box.as_ref() {
-        let r = Rect::new(b.at.0, b.at.1, BOX_W, BOX_H);
+        let r = Rect::new(b.at.0, s.osk_y(b.at.1, BOX_H), BOX_W, BOX_H);
         panel(ui, r, Color::rgb(BG));
         ui.hit(r, Action::Pat(Hit::Inside), "");
         let named = matches!(b.target, BoxTarget::Name(_));

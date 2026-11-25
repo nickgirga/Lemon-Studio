@@ -65,8 +65,11 @@ pub(super) fn hit(ui: &mut Ui, r: Rect, h: DHit, hint: &'static str) -> bool {
 
 /// Where a dialog of `w` x `h` sits: where its caption was dragged, else centred; inside the window either way.
 pub(super) fn place(s: &State, m: &Modal, w: f32, h: f32) -> Rect {
+    use crate::project_forms::Form;
     let (sw, sh) = s.screen;
-    let (x, y) = m.at.unwrap_or(((sw - w) / 2.0, (sh - h) / 2.0));
+    let text = matches!(&m.body, Body::File(_) | Body::Project(Form::Rename(_) | Form::Save(_) | Form::Export(_)));
+    let centred = ((sw - w) / 2.0, if text { s.osk_y((sh - h) / 2.0, h) } else { (sh - h) / 2.0 });
+    let (x, y) = m.at.unwrap_or(centred);
     let r = Rect::new(x.min(sw - w).max(0.0).round(), y.min(sh - h).max(0.0).round(), w, h);
     m.rect.set(r);
     r

@@ -1629,7 +1629,7 @@ pub fn paint_overlays(ui: &mut Ui, s: &State) {
         super::typein::paint(ui, s, e, t, norm);
     } else if let Some(e) = &s.playlist.edit {
         let t = ui.t;
-        let r = Rect::new(e.at.0, e.at.1, 150.0, 20.0);
+        let r = Rect::new(e.at.0, s.osk_y(e.at.1, 20.0), 150.0, 20.0);
         let hint = match e.target {
             pl::EditTarget::MixerInsert(_) => "How many mixer tracks to insert: type a number, Enter inserts, Esc cancels",
             pl::EditTarget::MixerGroup(_) => "Group name: type, Enter creates the group, Esc cancels",
