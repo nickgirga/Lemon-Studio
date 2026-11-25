@@ -45,6 +45,28 @@ use touch::{TouchGesture, TouchStage};
 #[cfg(target_os = "linux")]
 use touch::Kde;
 
+/// How long a touch or stylus stays still before it becomes a right-click instead of a left one.
+const TOUCH_HOLD: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldAction {
+    Wait,
+    Drag,
+    Context,
+}
+
+impl TouchGesture {
+    fn action(&self, at: (f64, f64), now: Instant) -> HoldAction {
+        if self.dragged(at) {
+            HoldAction::Drag
+        } else if now.saturating_duration_since(self.at) >= TOUCH_HOLD {
+            HoldAction::Context
+        } else {
+            HoldAction::Wait
+        }
+    }
+}
+
 struct Shell {
     app: App,
     window: Option<Rc<Window>>,
@@ -433,7 +455,7 @@ impl Shell {
         self.touch = Some(g);
         match g.stage {
             TouchStage::Pending => self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: at.into() }),
-            TouchStage::Left if self.lock.is_some() => self.held_motion((at.0 - last.0, at.1 - last.1)),
+            _ if self.lock.is_some() => self.held_motion((at.0 - last.0, at.1 - last.1)),
             _ => self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: at.into() }),
         }
     }
@@ -461,6 +483,14 @@ impl Shell {
                 self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Released, button });
             }
         }
+    }
+
+    /// The hold deadline: only now does a stationary gesture become a right-click, never a left press first.
+    fn touch_context(&mut self, el: &ActiveEventLoop, mut g: TouchGesture) {
+        g.stage = TouchStage::Right;
+        self.touch = Some(g);
+        self.mouse_event(el, g.window, WindowEvent::CursorMoved { device_id: g.device, position: g.from.into() });
+        self.mouse_event(el, g.window, WindowEvent::MouseInput { device_id: g.device, state: ElementState::Pressed, button: MouseButton::Right });
     }
 
     /// The detached surface for a native window, or `None` for the main window.
@@ -643,6 +673,13 @@ impl Shell {
                 self.pending = true;
             }
             menu_bar::update(views::menus::bar_model(&self.app.state));
+        }
+        if let Some(g) = self.touch.filter(|g| g.stage == TouchStage::Pending) {
+            if g.action(g.last, now) == HoldAction::Context {
+                self.touch_context(el, g);
+            } else {
+                wake = wake.min(g.at + TOUCH_HOLD);
+            }
         }
         self.pending |= self.app.tick();
         self.sync_detached(el);
@@ -2053,6 +2090,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A touch or stylus is a left drag when it moves early, a right-click only when held still, with movement winning
+    /// even after the hold time; a short undecided wait is just a tap.
+    #[test]
+    fn touch_hold_decisions() {
+        let g = TouchGesture {
+            window: WindowId::dummy(),
+            device: DeviceId::dummy(),
+            finger: 1,
+            from: (10.0, 10.0),
+            last: (10.0, 10.0),
+            at: Instant::now(),
+            stage: TouchStage::Pending,
+            mouse: false,
+        };
+        assert_eq!(g.action((11.0, 11.0), g.at), HoldAction::Wait);
+        assert_eq!(g.action((15.0, 10.0), g.at), HoldAction::Drag);
+        assert_eq!(g.action((10.0, 10.0), g.at + TOUCH_HOLD), HoldAction::Context);
+        assert_eq!(g.action((15.0, 10.0), g.at + TOUCH_HOLD), HoldAction::Drag);
+    }
 
     /// Frames come a little under one refresh apart: never further apart than `FRAME`, never closer than `IDLE`.
     #[test]
