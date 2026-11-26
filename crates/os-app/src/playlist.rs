@@ -3244,11 +3244,21 @@ fn clips_jumped(s: &State, g: &PGeom, grid: Rect, alt: bool, from: Vec<(usize, R
 
 /// Button released.
 pub fn drag_end(app: &mut App, d: PlDrag, grid: Rect) {
+    drag_finish(app, d, grid, true);
+}
+
+/// A second finger took over: finish the visible edit, but do not run release-only tool actions.
+pub fn drag_cancel(app: &mut App, d: PlDrag, grid: Rect) {
+    drag_finish(app, d, grid, false);
+}
+
+fn drag_finish(app: &mut App, d: PlDrag, grid: Rect, released: bool) {
     let s = &mut app.state;
     let g = PGeom::new(s, grid);
     let overlay = s.playlist.overlay.take();
     // A resized clip, as it is now, is the brush the next clips of its source copy.
-    if let PlDrag::ResizeL { orig, .. } | PlDrag::ResizeR { orig, .. } = &d
+    if released
+        && let PlDrag::ResizeL { orig, .. } | PlDrag::ResizeR { orig, .. } = &d
         && let Some(&c) = orig.first().and_then(|&(i, _)| clips(&s.session).get(i))
     {
         set_brush(s, c);
@@ -3286,7 +3296,7 @@ pub fn drag_end(app: &mut App, d: PlDrag, grid: Rect) {
             let now = app.state.session.transport.playing().then(|| app.state.session.transport.tick().max(0.0) as u32);
             crate::perform_ui::release(&mut app.state, now);
         }
-        PlDrag::Slice { .. } => {
+        PlDrag::Slice { .. } if released => {
             // Nothing sliced: no step.
             if let Some(Overlay::Slice { tick, t0, t1 }) = overlay {
                 if arr_edit(s, ARRANGER_EDIT, |s| slice(&mut s.session, tick, t0, t1)) == 0 {
@@ -3294,9 +3304,9 @@ pub fn drag_end(app: &mut App, d: PlDrag, grid: Rect) {
                 }
             }
         }
-        PlDrag::ZoomBox { x0, y0 } => zoom_to(app, grid, x0, y0),
+        PlDrag::ZoomBox { x0, y0 } if released => zoom_to(app, grid, x0, y0),
         PlDrag::Playback => app.state.session.transport.stop(),
-        PlDrag::SongPos => {
+        PlDrag::SongPos if released => {
             // The song jumps to the new position; a running pattern goes on as the song from there, a paused one
             // stops, as with the PAT / SONG switch (§7, audio/transport.md).
             if app.state.session.transport.playing() {
@@ -3330,7 +3340,7 @@ pub fn drag_end(app: &mut App, d: PlDrag, grid: Rect) {
             }
         }
         // A moved marker went back in position order with its step (`set_markers`, above).
-        PlDrag::Marker { .. } => {
+        PlDrag::Marker { .. } if released => {
             // The song position went to the marker: playback follows, as from the ruler (§7a).
             if app.state.session.transport.playing() && (app.state.session.transport.song() || !app.state.session.transport.paused()) {
                 let p = app.state.session.song_pos;

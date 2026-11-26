@@ -42,6 +42,14 @@ use winit::window::{CursorGrabMode, CursorIcon, ResizeDirection, Window, WindowI
 use app::App;
 use os_ui::Canvas;
 use touch::{TouchGesture, TouchStage};
+
+/// Two fingers that took over an editor gesture. A lifted finger stays `None` here until the other lifts too.
+#[derive(Clone, Copy)]
+struct PinchGesture {
+    window: WindowId,
+    device: DeviceId,
+    fingers: [Option<(u64, (f64, f64))>; 2],
+}
 #[cfg(target_os = "linux")]
 use touch::Kde;
 
@@ -99,6 +107,8 @@ struct Shell {
     key_on: Option<app::Win>,
     /// The undecided or active touch/stylus pan gesture (`touch_event`). Ordinary mouse input does not use it.
     touch: Option<TouchGesture>,
+    /// The two-finger gesture that superseded `touch`, if any.
+    pinch: Option<PinchGesture>,
     /// The last pointer position in each window, for an X11 stylus that arrives as mouse events.
     pointer: Option<(WindowId, (f64, f64))>,
     #[cfg(target_os = "linux")]
@@ -369,14 +379,25 @@ impl Shell {
     }
 
     /// The first touch or stylus is undecided until it moves: a short tap is a left click, a move past the slop either
-    /// pans the view under it or starts the ordinary left drag. Other fingers do nothing. The left press is held back
-    /// until the choice is made, so a pan does not first place a clip or note or trigger a control.
+    /// pans the view under it or starts the ordinary left drag. A second finger takes over as a pinch. The left press
+    /// is held back until the choice is made, so a pan does not first place a clip or note or trigger a control.
     fn touch_event(&mut self, el: &ActiveEventLoop, id: WindowId, touch: Touch) {
         let Touch { device_id, phase, location, id: finger, .. } = touch;
         let at = (location.x, location.y);
+        if self.pinch.is_some() {
+            match phase {
+                TouchPhase::Moved => self.pinch_move(id, device_id, finger, at),
+                TouchPhase::Ended | TouchPhase::Cancelled => self.pinch_end(id, device_id, finger),
+                _ => {}
+            }
+            return;
+        }
         match phase {
             TouchPhase::Started => {
-                if self.touch.is_some() {
+                if let Some(g) = self.touch {
+                    if !g.mouse && g.window == id && g.device == device_id && g.finger != finger {
+                        self.pinch_begin(el, id, g, finger, at);
+                    }
                     return;
                 }
                 let on = self.touch_surface(id);
@@ -388,6 +409,71 @@ impl Shell {
             TouchPhase::Ended if self.touch.is_some_and(|g| g.window == id && g.device == device_id && g.finger == finger) => self.touch_end(el, id, device_id, false),
             TouchPhase::Cancelled if self.touch.is_some_and(|g| g.window == id && g.device == device_id && g.finger == finger) => self.touch_end(el, id, device_id, true),
             _ => {}
+        }
+    }
+
+    /// A second finger wins over the pending click, pan or edit drag, then both points drive the editor gesture.
+    fn pinch_begin(&mut self, el: &ActiveEventLoop, id: WindowId, g: TouchGesture, finger: u64, at: (f64, f64)) {
+        let on = self.touch_surface(id);
+        let (Some(a), Some(b)) = (self.touch_point(id, g.last), self.touch_point(id, at)) else { return };
+        if !self.app.on(on, |app| app.touch_pinch_start(a, b)) {
+            return;
+        }
+        match g.stage {
+            TouchStage::Pending => {}
+            TouchStage::Right => {
+                self.mouse_event(el, id, WindowEvent::MouseInput { device_id: g.device, state: ElementState::Released, button: MouseButton::Right });
+            }
+            TouchStage::Pan => self.app.on(on, |app| app.touch_pan_cancel()),
+            TouchStage::Left => {
+                self.app.on(on, |app| app.touch_left_cancel());
+                #[cfg(target_os = "macos")]
+                if std::mem::take(&mut self.ctrl_click) {
+                    self.app.right_down = false;
+                }
+                self.grab = None;
+                self.unmax = None;
+                self.unlock_cursor();
+            }
+        }
+        self.touch = None;
+        self.pinch = Some(PinchGesture { window: id, device: g.device, fingers: [Some((g.finger, g.last)), Some((finger, at))] });
+        self.pending = true;
+    }
+
+    fn pinch_move(&mut self, id: WindowId, device: DeviceId, finger: u64, at: (f64, f64)) {
+        let Some(mut p) = self.pinch else { return };
+        if p.window != id || p.device != device {
+            return;
+        }
+        let Some(slot) = p.fingers.iter_mut().find(|f| f.is_some_and(|(held, _)| held == finger)) else { return };
+        *slot = Some((finger, at));
+        let (Some((_, a)), Some((_, b))) = (p.fingers[0], p.fingers[1]) else {
+            self.pinch = Some(p);
+            return;
+        };
+        self.pinch = Some(p);
+        let (Some(a), Some(b)) = (self.touch_point(id, a), self.touch_point(id, b)) else { return };
+        let on = self.touch_surface(id);
+        self.app.on(on, |app| app.touch_pinch(a, b));
+        self.pending = true;
+    }
+
+    fn pinch_end(&mut self, id: WindowId, device: DeviceId, finger: u64) {
+        let Some(mut p) = self.pinch.take() else { return };
+        if p.window != id || p.device != device {
+            self.pinch = Some(p);
+            return;
+        }
+        let Some(slot) = p.fingers.iter_mut().find(|f| f.is_some_and(|(held, _)| held == finger)) else {
+            self.pinch = Some(p);
+            return;
+        };
+        *slot = None;
+        let on = self.touch_surface(id);
+        self.app.on(on, |app| app.touch_pinch_end());
+        if p.fingers.iter().any(Option::is_some) {
+            self.pinch = Some(p);
         }
     }
 
@@ -859,7 +945,7 @@ impl ApplicationHandler for Shell {
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         // While a finger holds the drag its own moves drive it (`touch_event`); a system that also reports them as raw
         // motion would move it twice.
-        if let (DeviceEvent::MouseMotion { delta }, None) = (event, self.touch) {
+        if let (DeviceEvent::MouseMotion { delta }, None, None) = (event, self.touch, self.pinch) {
             self.held_motion(delta);
         }
     }
@@ -2046,6 +2132,7 @@ pub fn run() {
         detached: Vec::new(),
         key_on: None,
         touch: None,
+        pinch: None,
         pointer: None,
         #[cfg(target_os = "linux")]
         kde: Kde::default(),
