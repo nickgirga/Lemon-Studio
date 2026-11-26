@@ -13,6 +13,7 @@ use crate::knobs::KnobUi;
 use crate::history::ChannelControl;
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use os_engine::PlayMode;
 use os_model::{ChannelKind, Note, Project};
@@ -377,6 +378,8 @@ pub enum Scroll {
     PopupSub,
     /// The plugin palette's list (spec: ui/plugin-menu.md §6.2).
     Palette,
+    /// The browser's list, which has no scroll bar.
+    Browser,
 }
 
 /// A scroll bar painted this frame.
@@ -433,6 +436,57 @@ const BAR_EDGE_PX: f32 = 4.0;
 /// Hint over a zooming thumb end.
 const BAR_EDGE_HINT: &str = "Drag to zoom - the other end stays put";
 
+/// A touch or stylus pan in progress: the pointer's speed per axis, for the glide after the finger lifts.
+struct Pan {
+    /// Each axis, and whether it follows the pointer's vertical movement.
+    axes: Vec<(Scroll, bool)>,
+    /// Pointer speed per axis, px/ms.
+    vel: Vec<f32>,
+    /// The pointer's last position and when it was there.
+    pos: (f32, f32),
+    at: Instant,
+    /// When the pointer last moved.
+    moved_at: Instant,
+    /// The threshold-crossing position was sampled: it is a baseline, not a speed.
+    sampled: bool,
+}
+
+/// A touch pan's momentum after the finger lifts: content px/ms per axis, the fraction not applied yet, and the
+/// surface whose scroll bars bound it (`None`: the main window).
+struct Glide {
+    axes: Vec<(Scroll, f32, f32)>,
+    at: Instant,
+    on: Option<Win>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinchAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// A two-finger editor gesture: its midpoint pans, while separation along one clear direction zooms.
+struct Pinch {
+    target: Win,
+    from: [(f32, f32); 2],
+    axis: Option<PinchAxis>,
+    span: f32,
+    /// The view and content under the midpoint when panning or zooming was anchored.
+    middle: (f32, f32),
+    scroll: (f32, f32),
+    zoom: (f32, f32),
+    content: (f32, f32),
+}
+
+/// The time constant of a pan's glide (ms): it loses all but 1/e of its speed in this time.
+const GLIDE_MS: f32 = 110.0;
+/// Below this speed a glide stops (content px/ms).
+const GLIDE_MIN: f32 = 0.02;
+/// The fastest a glide starts (content px/ms).
+const GLIDE_MAX: f32 = 3.0;
+/// A finger still this long before it lifts leaves no glide (ms).
+const GLIDE_IDLE: u128 = 80;
+
 /// What needs repainting before the next present.
 #[derive(Clone, PartialEq)]
 enum Damage {
@@ -456,6 +510,7 @@ pub fn scroll_win(t: Scroll) -> Option<Win> {
         Scroll::MixerX => Some(Win::Mixer),
         Scroll::RackX | Scroll::RackY => Some(Win::ChannelRack),
         Scroll::Palette => Some(Win::PluginPalette),
+        Scroll::Browser => Some(Win::Browser),
         Scroll::Settings | Scroll::PlugTable | Scroll::Popup | Scroll::PopupSub => None,
     }
 }
@@ -1465,6 +1520,11 @@ pub struct App {
     pub hint: Cow<'static, str>,
     pub mouse: (f32, f32),
     pub drag: Option<Drag>,
+    /// A touch or stylus pan in progress, and its glide after the finger lifts.
+    pan: Option<Pan>,
+    glide: Option<Glide>,
+    /// A two-finger playlist or piano-roll gesture.
+    pinch: Option<Pinch>,
     /// A held click that has not moved yet (Click-and-hold & special gesture functions, `crate::hold`).
     pub hold: Option<crate::hold::Hold>,
     /// Views easing to where the wheel sent them (General ▸ Display ▸ Smoothing, `crate::smooth`).
@@ -1731,6 +1791,9 @@ impl App {
             hint: Cow::Borrowed(""),
             mouse: (-1.0, -1.0),
             drag: None,
+            pan: None,
+            glide: None,
+            pinch: None,
             hold: None,
             smooth: Default::default(),
             warp: None,
@@ -3978,6 +4041,7 @@ impl App {
             || self.state.motion.borrow().moving()
             || self.hold.is_some()
             || self.smooth.running()
+            || self.glide.is_some()
             || !self.state.session.ext_pending.is_empty()
             || self.remote.busy()
             || self.state.browser_marquee.borrow().is_some()
@@ -4110,6 +4174,7 @@ impl App {
         self.song_pos_tick(now);
         self.hold_tick(now);
         self.ease_tick(now);
+        self.glide_tick(now);
         self.cables_tick(now);
         self.motion_tick();
         self.marquee_tick(now);
@@ -5763,18 +5828,7 @@ impl App {
                 Drag::Scroll { m0, axes } => {
                     for (t, vertical, p0, ratio) in axes {
                         let d = if vertical { y - m0.1 } else { x - m0.0 };
-                        let v = p0 + d * ratio;
-                        if matches!(t, Scroll::PlaylistX | Scroll::PlaylistY) {
-                            // In whole steps the drawn pixels can move by (`playlist_scrolled`).
-                            let before = self.state.playlist_scroll;
-                            let cur = self.scroll_get(t);
-                            let v = blit_step(self.px_scale).map_or(v, |q| cur + ((v - cur) / q).round() * q);
-                            self.scroll_set(t, v);
-                            self.playlist_scrolled(before);
-                        } else {
-                            self.scroll_set(t, v);
-                            self.damage_scroll(t);
-                        }
+                        self.apply_scroll(t, p0 + d * ratio);
                     }
                 }
                 Drag::NoteMove { x0, y0, orig } => {
@@ -6107,6 +6161,9 @@ impl App {
                     self.damage_band(HINT_RECT);
                 }
             }
+            if self.pan.is_some() {
+                self.pan_sample(x, y);
+            }
             return true;
         }
         let (hover, mut hint, rect) = match self.top_hit(x, y) {
@@ -6325,6 +6382,7 @@ impl App {
         // The popups and boxes this press opens go on the surface it was made on (a detached window's, `on_surface`).
         self.state.overlay_on = self.state.surface;
         self.invalidate();
+        self.glide = None;
         self.hold = None;
         let (x, y) = self.mouse;
         let action = self.top_hit(x, y).map(|h| h.action.clone());
@@ -6542,14 +6600,14 @@ impl App {
             Scroll::Settings => s.settings.scroll,
             Scroll::PlugTable => s.plugdb.top as f32 * views::settings::TABLE_ROW_H,
             Scroll::Palette => s.palette.scroll,
+            Scroll::Browser => s.browser_scroll,
             Scroll::Popup | Scroll::PopupSub => s.playlist.popup.as_ref().map_or(0.0, |p| p.scroll[usize::from(t == Scroll::PopupSub)] as f32),
         }
     }
 
     /// Set an axis, clamped to what its scroll bar allows (last frame).
     pub fn scroll_set(&mut self, t: Scroll, v: f32) {
-        let unbounded = if matches!(t, Scroll::RackX | Scroll::RackY) { 0.0 } else { f32::MAX };
-        let max = self.bar(t).map_or(unbounded, |b| b.max);
+        let max = self.scroll_max(t);
         let v = v.clamp(0.0, max.max(0.0));
         let s = &mut self.state;
         match t {
@@ -6565,6 +6623,7 @@ impl App {
             Scroll::Settings => s.settings.scroll = v,
             Scroll::PlugTable => s.plugdb.top = (v / views::settings::TABLE_ROW_H).round() as usize,
             Scroll::Palette => s.palette.scroll = v,
+            Scroll::Browser => s.browser_scroll = v,
             Scroll::Popup | Scroll::PopupSub => {
                 let Some(p) = s.playlist.popup.as_mut() else { return };
                 let (k, col) = (usize::from(t == Scroll::PopupSub), v.round() as usize);
@@ -6575,6 +6634,30 @@ impl App {
                 }
                 p.scroll[k] = col;
             }
+        }
+    }
+
+    /// The largest value axis `t` allows (from its scroll bar, or the browser's own list).
+    fn scroll_max(&self, t: Scroll) -> f32 {
+        if t == Scroll::Browser {
+            return crate::views::browser::max_scroll(&self.state);
+        }
+        let unbounded = if matches!(t, Scroll::RackX | Scroll::RackY) { 0.0 } else { f32::MAX };
+        self.bar(t).map_or(unbounded, |b| b.max)
+    }
+
+    /// Set axis `t` to `v`, with the playlist's scroll drawn by moving its pixels instead of repainting: the way a
+    /// grab scroll, a touch pan and its glide move a view.
+    fn apply_scroll(&mut self, t: Scroll, v: f32) {
+        if matches!(t, Scroll::PlaylistX | Scroll::PlaylistY) {
+            let before = self.state.playlist_scroll;
+            let cur = self.scroll_get(t);
+            let v = blit_step(self.px_scale).map_or(v, |q| cur + ((v - cur) / q).round() * q);
+            self.scroll_set(t, v);
+            self.playlist_scrolled(before);
+        } else {
+            self.scroll_set(t, v);
+            self.damage_scroll(t);
         }
     }
 
@@ -6664,12 +6747,441 @@ impl App {
         self.invalidate();
     }
 
+    /// Whether scroll target `t` has content to move.
+    fn can_scroll(&self, t: Scroll) -> bool {
+        match t {
+            Scroll::Browser => crate::views::browser::max_scroll(&self.state) > 0.0,
+            _ => self.bar(t).is_some_and(|b| b.max > 0.0),
+        }
+    }
+
+    /// A touch or stylus drag that passed the movement threshold: scroll the view under `self.mouse` when it pans
+    /// there, instead of pressing and dragging what is under it. `delta` is how far the gesture has moved so far (a
+    /// browser row scrolls up and down, while a sideways drag carries the sample out). Returns whether a pan started.
+    pub fn touch_pan(&mut self, delta: (f32, f32)) -> bool {
+        // Menus, dialogs and value boxes keep their own drags and clicks.
+        if self.modal_open()
+            || self.state.menu_open.is_some()
+            || self.state.playlist.popup.is_some()
+            || self.state.lane_menu
+            || crate::typein_ui::is_open(&self.state)
+            || crate::remote_ui::is_open(&self.state)
+        {
+            return false;
+        }
+        let (x, y) = self.mouse;
+        let Some(action) = self.top_hit(x, y).map(|h| h.action.clone()) else { return false };
+        let targets: &[(Scroll, bool)] = match &action {
+            Action::PlaylistArea => {
+                // The Draw tool on empty grid: a tap places a clip, a drag pans (spec: ui/playlist.md §6).
+                if self.state.playlist.tool != crate::playlist::PlTool::Draw {
+                    return false;
+                }
+                let Some(grid) = self.pl_grid else { return false };
+                let g = crate::playlist::PGeom::new(&self.state, grid);
+                if crate::playlist::clip_at(&self.state.session, &g, x, y).is_some() {
+                    return false;
+                }
+                &[(Scroll::PlaylistX, false), (Scroll::PlaylistY, true)]
+            }
+            Action::PianoGrid => {
+                // The Draw tool on empty grid: a tap places a note, a drag pans (spec: ui/piano-roll.md §8).
+                if self.state.piano.tool != crate::piano::Tool::Draw {
+                    return false;
+                }
+                let Some(g) = self.piano_geom() else { return false };
+                if crate::piano::note_at(&self.state, &g, x, y).is_some() {
+                    return false;
+                }
+                &[(Scroll::PianoX, false), (Scroll::PianoY, true)]
+            }
+            // The browser scrolls up and down; a sideways drag carries a sample out to the playlist.
+            Action::BrowserList | Action::BrowserRow(_) => {
+                if delta.0.abs() > delta.1.abs() {
+                    return false;
+                }
+                &[(Scroll::Browser, true)]
+            }
+            Action::PlPick(_) | Action::PlPickList => &[(Scroll::PlPick, true)],
+            // The rack scrolls up and down only, from its background and channel names: its controls keep their drags.
+            Action::RackArea | Action::ChannelSelect(_) => &[(Scroll::RackY, true)],
+            Action::MixerArea => &[(Scroll::MixerX, false)],
+            Action::Palette(crate::plugin_palette::PalAct::List | crate::plugin_palette::PalAct::Row(_)) => &[(Scroll::Palette, true)],
+            Action::Settings(a) => {
+                use crate::views::settings::{Plug, SAct};
+                // Sliders, knobs, value boxes, the colour picker and the MIDI page's drags are controls, not page.
+                if crate::knobs::Control::of(&action).is_some()
+                    || matches!(
+                        a,
+                        SAct::Close
+                            | SAct::Ppi
+                            | SAct::PickBody
+                            | SAct::PickClose
+                            | SAct::PickPart(_)
+                            | SAct::PickSv
+                            | SAct::PickHue
+                            | SAct::PickRevert
+                            | SAct::NameBody
+                            | SAct::NameOk
+                            | SAct::NameCancel
+                            | SAct::Midi(_)
+                            | SAct::Number(_)
+                            | SAct::Info(_)
+                            | SAct::FolderPick(_)
+                            | SAct::FolderCell(..)
+                    )
+                {
+                    return false;
+                }
+                if matches!(a, SAct::Plug(Plug::Table | Plug::Row(_) | Plug::Star(_) | Plug::Show(_))) {
+                    &[(Scroll::PlugTable, true)]
+                } else {
+                    &[(Scroll::Settings, true)]
+                }
+            }
+            _ => return false,
+        };
+        if !targets.iter().any(|&(t, _)| self.can_scroll(t)) {
+            return false;
+        }
+        let axes = targets.iter().map(|&(t, vertical)| (t, vertical, self.scroll_get(t), -1.0)).collect();
+        self.smooth.stop();
+        self.glide = None;
+        self.drag = Some(Drag::Scroll { m0: (x, y), axes });
+        let now = crate::anim::now();
+        self.pan = Some(Pan { axes: targets.to_vec(), vel: vec![0.0; targets.len()], pos: (x, y), at: now, moved_at: now, sampled: false });
+        true
+    }
+
+    /// A finger or stylus touched the canvas: a glide it may have started stops where it is.
+    pub fn touch_start(&mut self) {
+        if self.glide.take().is_some() {
+            self.invalidate();
+        }
+    }
+
+    /// Start a two-finger editor gesture when both points are over the same playlist or piano-roll grid.
+    pub fn touch_pinch_start(&mut self, a: (f32, f32), b: (f32, f32)) -> bool {
+        if self.modal_open()
+            || self.state.menu_open.is_some()
+            || self.state.playlist.popup.is_some()
+            || self.state.lane_menu
+            || crate::typein_ui::is_open(&self.state)
+            || crate::remote_ui::is_open(&self.state)
+        {
+            return false;
+        }
+        let target = |(x, y): (f32, f32)| match self.top_hit(x, y).map(|h| &h.action) {
+            Some(Action::PlaylistArea) => Some(Win::Playlist),
+            Some(Action::PianoGrid | Action::PianoNote(_)) => Some(Win::PianoRoll),
+            _ => None,
+        };
+        let Some(target) = target(a).filter(|&t| target(b) == Some(t)) else { return false };
+        self.smooth.stop();
+        self.glide = None;
+        let (x, y, zoom) = match target {
+            Win::Playlist => (Scroll::PlaylistX, Scroll::PlaylistY, (self.state.playlist_bar_w, self.state.playlist.row_h)),
+            Win::PianoRoll => (Scroll::PianoX, Scroll::PianoY, (self.state.piano.px_per_beat, self.state.piano.row_h)),
+            _ => return false,
+        };
+        let scroll = (self.scroll_get(x), self.scroll_get(y));
+        let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        self.pinch = Some(Pinch { target, from: [a, b], axis: None, span: 0.0, middle, scroll, zoom, content: (0.0, 0.0) });
+        true
+    }
+
+    /// Move a two-finger editor gesture. The midpoint pans on both axes; only clear horizontal or vertical separation
+    /// zooms, and that zoom axis is then held until the gesture ends.
+    pub fn touch_pinch(&mut self, a: (f32, f32), b: (f32, f32)) {
+        let Some(mut p) = self.pinch.take() else { return };
+        let new = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let spans = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).abs(), (a.1 - b.1).abs());
+        let (sx, sy) = spans(a, b);
+        if p.axis.is_none() {
+            let (sx0, sy0) = spans(p.from[0], p.from[1]);
+            let horizontal = sx >= sy * 2.0 && (sx - sx0).abs() >= crate::hold::SLOP;
+            let vertical = sy >= sx * 2.0 && (sy - sy0).abs() >= crate::hold::SLOP;
+            if horizontal || vertical {
+                p.axis = Some(if horizontal { PinchAxis::Horizontal } else { PinchAxis::Vertical });
+                p.span = if horizontal { sx } else { sy };
+                p.middle = new;
+                let (x, y, zoom) = match p.target {
+                    Win::Playlist => (Scroll::PlaylistX, Scroll::PlaylistY, (self.state.playlist_bar_w, self.state.playlist.row_h)),
+                    Win::PianoRoll => (Scroll::PianoX, Scroll::PianoY, (self.state.piano.px_per_beat, self.state.piano.row_h)),
+                    _ => return,
+                };
+                p.scroll = (self.scroll_get(x), self.scroll_get(y));
+                p.zoom = zoom;
+                p.content = self.pinch_content(p.target, new);
+            }
+        }
+        let ratio = match (p.axis, p.span) {
+            (Some(PinchAxis::Horizontal), span) if span > 0.0 => sx / span,
+            (Some(PinchAxis::Vertical), span) if span > 0.0 => sy / span,
+            _ => 1.0,
+        };
+        self.pinch_move(&p, new, ratio);
+        self.pinch = Some(p);
+    }
+
+    /// Time and row content at a gesture's anchor, in the units each editor's zoom uses.
+    fn pinch_content(&self, target: Win, at: (f32, f32)) -> (f32, f32) {
+        match target {
+            Win::Playlist => {
+                let Some(grid) = self.pl_grid else { return (0.0, 0.0) };
+                let x = (self.state.playlist_scroll.0 + at.0 - grid.x) / self.state.playlist_bar_w;
+                let rows = crate::playlist::Rows::new(&self.state);
+                let cy = (self.state.playlist_scroll.1 + at.1 - grid.y).max(0.0);
+                let t = rows.at(cy);
+                let frac = ((cy - rows.top(t)) / rows.height(t).max(1.0)).clamp(0.0, 1.0);
+                (x, f32::from(t) + frac)
+            }
+            Win::PianoRoll => {
+                let Some(g) = self.piano_geom() else { return (0.0, 0.0) };
+                (g.tick_at(at.0), (self.state.piano.scroll_y + at.1 - g.grid.y) / self.state.piano.row_h)
+            }
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// Keep a zooming axis's existing scroll bar in step before clamping its new position.
+    fn pinch_bar_zoom(&mut self, t: Scroll, old: f32, new: f32) {
+        if let Some(b) = self.bars.iter_mut().find(|b| b.target == t).filter(|_| old > 0.0) {
+            b.max = ((b.max + b.view) * (new / old) - b.view).max(0.0);
+        }
+    }
+
+    /// Apply the whole gesture from its anchor, not rounded increments: slow midpoint motion is never lost.
+    fn pinch_move(&mut self, p: &Pinch, new: (f32, f32), ratio: f32) {
+        let (mut x, mut y) = (p.scroll.0 - (new.0 - p.middle.0), p.scroll.1 - (new.1 - p.middle.1));
+        match p.target {
+            Win::Playlist => {
+                let Some(grid) = self.pl_grid else { return };
+                let old = (self.state.playlist_bar_w, self.state.playlist.row_h);
+                match p.axis {
+                    Some(PinchAxis::Horizontal) => {
+                        let z = (p.zoom.0 * ratio).clamp(4.0, 600.0);
+                        self.state.playlist_bar_w = z;
+                        self.pinch_bar_zoom(Scroll::PlaylistX, old.0, z);
+                        x = p.content.0 * z - (new.0 - grid.x);
+                    }
+                    Some(PinchAxis::Vertical) => {
+                        self.state.playlist.row_h = ((p.zoom.1 * ratio / 2.0).round() * 2.0).clamp(crate::playlist::ROW_MIN, crate::playlist::ROW_MAX);
+                        let rows = crate::playlist::Rows::new(&self.state);
+                        if let Some(b) = self.bars.iter_mut().find(|b| b.target == Scroll::PlaylistY) {
+                            b.max = (rows.total() - b.view).max(0.0);
+                        }
+                        let t = p.content.1.max(0.0).trunc() as u16;
+                        y = rows.top(t) + p.content.1.fract() * rows.height(t) - (new.1 - grid.y);
+                    }
+                    None => {}
+                }
+                let zoomed = match p.axis {
+                    Some(PinchAxis::Horizontal) => self.state.playlist_bar_w != old.0,
+                    Some(PinchAxis::Vertical) => self.state.playlist.row_h != old.1,
+                    None => false,
+                };
+                if zoomed {
+                    self.scroll_set(Scroll::PlaylistX, x);
+                    self.scroll_set(Scroll::PlaylistY, y);
+                    self.damage_win(Win::Playlist);
+                } else {
+                    self.apply_scroll(Scroll::PlaylistX, x);
+                    self.apply_scroll(Scroll::PlaylistY, y);
+                }
+            }
+            Win::PianoRoll => {
+                let Some(g) = self.piano_geom() else { return };
+                let old = (self.state.piano.px_per_beat, self.state.piano.row_h);
+                match p.axis {
+                    Some(PinchAxis::Horizontal) => {
+                        let z = (p.zoom.0 * ratio).clamp(6.0, 1600.0);
+                        self.state.piano.px_per_beat = z;
+                        let ppt = z / f32::from(self.state.session.project.ppq.max(4));
+                        x = p.content.0 * ppt - (new.0 - g.grid.x);
+                        // PianoX's span depends on the view and proposed scroll, not just the old zoom (`views::piano`).
+                        let view = g.grid.w / ppt;
+                        let len = crate::edit::notes::pattern_length(&self.state.session, self.state.pattern()) as f32;
+                        let span = self.state.piano.bar_span.unwrap_or(len.max((x / ppt).max(0.0) + view) + view / 2.0);
+                        if let Some(b) = self.bars.iter_mut().find(|b| b.target == Scroll::PianoX) {
+                            b.max = (span * ppt - b.view).max(0.0);
+                        }
+                    }
+                    Some(PinchAxis::Vertical) => {
+                        let row = (p.zoom.1 * ratio).round().clamp(piano::MIN_ROW, piano::MAX_ROW);
+                        self.state.piano.row_h = row;
+                        self.pinch_bar_zoom(Scroll::PianoY, old.1, row);
+                        y = p.content.1 * row - (new.1 - g.grid.y);
+                    }
+                    None => {}
+                }
+                let zoomed = match p.axis {
+                    Some(PinchAxis::Horizontal) => self.state.piano.px_per_beat != old.0,
+                    Some(PinchAxis::Vertical) => self.state.piano.row_h != old.1,
+                    None => false,
+                };
+                if zoomed {
+                    self.scroll_set(Scroll::PianoX, x);
+                    self.scroll_set(Scroll::PianoY, y);
+                    piano::clamp_scroll(&mut self.state, g.grid.h);
+                    self.damage_win(Win::PianoRoll);
+                } else {
+                    self.apply_scroll(Scroll::PianoX, x);
+                    self.apply_scroll(Scroll::PianoY, y);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One finger lifted: the remaining one stays inert until it lifts too.
+    pub fn touch_pinch_end(&mut self) {
+        self.pinch = None;
+    }
+
+    /// A second finger took over a left drag: stop it without running release-only actions (slice, zoom box or drop).
+    pub fn touch_left_cancel(&mut self) {
+        self.pan = None;
+        self.hold = None;
+        self.shift_clone = false;
+        self.scrub_release();
+        self.hold_key(None, false);
+        self.armed = None;
+        self.armed_right = None;
+        self.pressed = None;
+        self.raise_at = None;
+        if self.cross_drag() {
+            self.browser_cancel();
+        }
+        match self.drag.take() {
+            Some(Drag::Pl(d)) => {
+                if let Some(grid) = self.pl_grid {
+                    crate::playlist::drag_cancel(self, d, grid);
+                }
+            }
+            Some(Drag::NoteMove { .. } | Drag::NoteResize { .. } | Drag::NoteErase | Drag::NoteMute { .. } | Drag::NotePaint { .. }) => {
+                piano::finish_edit(&mut self.state);
+                self.state.session.dirty = true;
+            }
+            Some(Drag::Velocity { .. }) => self.state.session.dirty = true,
+            Some(Drag::BarEdge { .. }) => self.state.piano.bar_span = None,
+            _ => {}
+        }
+        self.state.piano.overlay = None;
+        self.state.playlist.overlay = None;
+        crate::history::settle(&mut self.state.session);
+        self.invalidate();
+    }
+
+    /// A cancelled touch pan: stop at once, with no glide and no click.
+    pub fn touch_pan_cancel(&mut self) {
+        if self.pan.take().is_some() {
+            self.drag = None;
+            self.glide = None;
+            self.invalidate();
+        }
+    }
+
+    /// Samples the pointer's speed while a touch pan runs.
+    fn pan_sample(&mut self, x: f32, y: f32) {
+        let now = crate::anim::now();
+        let Some(p) = self.pan.as_mut() else { return };
+        let dt = now.saturating_duration_since(p.at).as_secs_f32() * 1000.0;
+        let (dx, dy) = (x - p.pos.0, y - p.pos.1);
+        let first = !p.sampled;
+        p.sampled = true;
+        p.at = now;
+        p.pos = (x, y);
+        // The shell's first move crosses the slop: it starts the pan, but says nothing about the finger's speed.
+        if first || dt <= 0.0 || (dx == 0.0 && dy == 0.0) {
+            return;
+        }
+        for (v, &(_, vertical)) in p.vel.iter_mut().zip(&p.axes) {
+            let d = if vertical { dy } else { dx };
+            *v = *v * 0.5 + d / dt * 0.5;
+        }
+        p.moved_at = now;
+    }
+
+    /// The pan's finger lifted: start its glide, unless it had stopped before lifting.
+    fn pan_end(&mut self) {
+        let Some(p) = self.pan.take() else { return };
+        let now = crate::anim::now();
+        if now.saturating_duration_since(p.moved_at).as_millis() > GLIDE_IDLE {
+            return;
+        }
+        let axes: Vec<(Scroll, f32, f32)> = p
+            .axes
+            .iter()
+            .zip(p.vel)
+            .filter_map(|(&(t, _), v)| {
+                // The content follows the finger, so the glide carries on the other way.
+                let v = (-v).clamp(-GLIDE_MAX, GLIDE_MAX);
+                (v.abs() > GLIDE_MIN).then_some((t, v, 0.0))
+            })
+            .collect();
+        if !axes.is_empty() {
+            self.glide = Some(Glide { axes, at: now, on: self.state.surface });
+            self.invalidate();
+        }
+    }
+
+    /// Moves a touch pan's glide on the surface it started on: a detached window's bars and damage are its own.
+    fn glide_tick(&mut self, now: Instant) {
+        let Some(on) = self.glide.as_ref().map(|g| g.on) else { return };
+        match on {
+            None => self.glide_step(now),
+            Some(w) if self.state.is_detached(w) => self.on_surface(w, |a| a.glide_step(now)),
+            // Its surface went away (or came back into the main window): stop rather than use another window's bars.
+            Some(_) => self.glide = None,
+        }
+    }
+
+    /// One frame of the momentum after the finger lifted.
+    fn glide_step(&mut self, now: Instant) {
+        let Some(mut g) = self.glide.take() else { return };
+        let dt = now.saturating_duration_since(g.at).as_secs_f32() * 1000.0;
+        g.at = now;
+        if dt <= 0.0 {
+            self.glide = Some(g);
+            return;
+        }
+        // A stalled frame does not throw the view: step at most a twentieth of a second.
+        let dt = dt.min(50.0);
+        let decay = (-dt / GLIDE_MS).exp();
+        let mut axes = std::mem::take(&mut g.axes);
+        for (t, v, carry) in &mut axes {
+            *v *= decay;
+            if v.abs() < GLIDE_MIN {
+                *v = 0.0;
+            }
+            let before = self.scroll_get(*t);
+            let want = *v * dt + *carry;
+            let max = self.scroll_max(*t);
+            // An edge stops that axis: it must not keep pushing into it.
+            if (before <= 0.0 && want < 0.0) || (before >= max && want > 0.0) {
+                *v = 0.0;
+                *carry = 0.0;
+                continue;
+            }
+            self.apply_scroll(*t, before + want);
+            // What a view that moves in whole rows did not use yet waits for the next frame.
+            *carry = want - (self.scroll_get(*t) - before);
+        }
+        axes.retain(|a| a.1 != 0.0);
+        if !axes.is_empty() {
+            g.axes = axes;
+            self.glide = Some(g);
+        }
+    }
+
     /// Middle button: grab-scroll the Piano roll and Playlist (FL manual: middle-drag scrolls
     /// both directions).
     pub fn mouse_down_middle(&mut self) {
         // The popups and boxes this press opens go on the surface it was made on (a detached window's, `on_surface`).
         self.state.overlay_on = self.state.surface;
         self.close_song_info();
+        self.glide = None;
         if crate::typein_ui::is_open(&self.state) || crate::remote_ui::is_open(&self.state) || self.modal_open() {
             return;
         }
@@ -6713,6 +7225,7 @@ impl App {
         // The popups and boxes this press opens go on the surface it was made on (a detached window's, `on_surface`).
         self.state.overlay_on = self.state.surface;
         self.close_song_info();
+        self.glide = None;
         if crate::typein_ui::is_open(&self.state) || crate::remote_ui::is_open(&self.state) || self.modal_open() {
             return;
         }
@@ -6951,6 +7464,7 @@ impl App {
     }
 
     pub fn mouse_up(&mut self) {
+        self.pan_end();
         self.hold = None;
         self.shift_clone = false;
         self.release();
@@ -7406,6 +7920,7 @@ impl App {
     }
 
     pub fn wheel(&mut self, dx: f32, dy: f32, shift: bool, ctrl: bool) {
+        self.glide = None;
         self.wheel_pause(crate::time::now());
         if self.modal_open() {
             return self.dialog_wheel(dy);
@@ -20543,6 +21058,290 @@ mod tests {
             app.ctrl = false;
             assert_eq!(app.state.playlist.sel.len(), 5, "{tool:?}: every clip, and it stays");
         }
+    }
+
+    /// Touch and stylus drags pan empty Draw-tool grids, not clips or the other tools' drags.
+    #[test]
+    fn touch_pan_scrolls_empty_grid_with_the_draw_tool() {
+        use crate::playlist::{self as pl, PlTool};
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let (mut app, _, _, bar) = ruler_app(&mut c);
+        app.state.playlist.row_h = 300.0;
+        pl::arr_mut(&mut app.state.session).clips.clear();
+        for at in [3 * bar, 40 * bar] {
+            pl::arr_mut(&mut app.state.session).clips.push(os_model::Clip::new(at, bar, 0, os_model::ClipSource::Pattern(1)));
+        }
+        app.state.playlist.tool = PlTool::Draw;
+        frame(&mut app, &mut c, None);
+        let g = pl::PGeom::new(&app.state, app.pl_grid().expect("playlist grid"));
+        let (x, y) = (g.x_of(bar as f32), g.y_of(0) + 30.0);
+        assert!(g.grid.contains(x, y) && app.top_hit(x, y).is_some_and(|h| h.action == Action::PlaylistArea));
+        app.mouse_move(x, y);
+        assert!(app.touch_pan((0.0, 20.0)), "the empty grid pans");
+        assert!(matches!(app.drag, Some(Drag::Scroll { .. })));
+        let before = app.scroll_get(Scroll::PlaylistY);
+        app.mouse_move(x, y - 60.0);
+        assert!(app.scroll_get(Scroll::PlaylistY) > before, "the content follows the finger");
+        app.touch_pan_cancel();
+        // A clip keeps its drag; so does another tool.
+        let clip = g.body(&pl::clips(&app.state.session)[0]);
+        app.mouse_move(clip.cx(), clip.cy());
+        assert!(!app.touch_pan((0.0, 20.0)), "a clip drags");
+        app.state.playlist.tool = PlTool::Select;
+        app.mouse_move(x, y);
+        assert!(!app.touch_pan((0.0, 20.0)), "the Select tool keeps its box");
+    }
+
+    /// The piano roll follows the same empty-grid Draw-tool rule, and a note keeps its drag.
+    #[test]
+    fn touch_pan_scrolls_the_piano_roll_only_on_empty_draw_grid() {
+        let (mut app, _) = piano_with_note(64);
+        let g = app.piano_geom().expect("piano roll geometry");
+        let p = (g.grid.x + 20.0, g.grid.y + 20.0);
+        assert_eq!(app.top_hit(p.0, p.1).map(|h| h.action.clone()), Some(Action::PianoGrid));
+        app.mouse_move(p.0, p.1);
+        assert!(app.touch_pan((0.0, 20.0)));
+        let before = app.scroll_get(Scroll::PianoY);
+        app.mouse_move(p.0, p.1 - 40.0);
+        assert!(app.scroll_get(Scroll::PianoY) > before);
+        app.touch_pan_cancel();
+        let note = piano::notes(&app.state.session)[0];
+        let r = g.note_rect(&note).expect("the note is shown");
+        app.mouse_move(r.cx(), r.cy());
+        assert!(!app.touch_pan((0.0, 20.0)), "a note drags");
+        app.state.piano.tool = piano::Tool::Select;
+        app.mouse_move(p.0, p.1);
+        assert!(!app.touch_pan((0.0, 20.0)), "the Select tool keeps its box");
+    }
+
+    /// A playlist pinch pans with its midpoint and zooms only the clear separation axis.
+    #[test]
+    fn playlist_pinch_zooms_and_pans() {
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let (mut app, _, _, _) = ruler_app(&mut c);
+        app.state.playlist.tool = crate::playlist::PlTool::Select;
+        let grid = app.pl_grid.expect("playlist grid");
+        let (cx, cy) = (grid.cx(), grid.cy());
+        let z0 = app.state.playlist_bar_w;
+        let sx0 = app.state.playlist_scroll.0;
+        assert!(app.touch_pinch_start((cx - 50.0, cy), (cx + 50.0, cy)));
+        // Crossing the slop chooses horizontal zoom, but establishes its baseline without a zoom jump.
+        app.touch_pinch((cx - 60.0, cy), (cx + 60.0, cy));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Horizontal));
+        assert_eq!(app.state.playlist_bar_w, z0);
+        // Expand 120 -> 180 while the midpoint moves right and down.
+        app.touch_pinch((cx - 75.0, cy + 7.0), (cx + 105.0, cy + 7.0));
+        let z1 = z0 * 1.5;
+        let want_x = ((sx0 + cx - grid.x) / z0) * z1 - (cx - grid.x) - 15.0;
+        assert!((app.state.playlist_bar_w - z1).abs() < 0.001);
+        assert!((app.state.playlist_scroll.0 - want_x.max(0.0)).abs() < 0.001);
+        assert_eq!(app.state.playlist_scroll.1, 0.0, "seven pixels down clamps at the top");
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Horizontal), "the axis stays locked");
+        app.scrolled = None;
+        app.touch_pinch((cx - 60.0, cy), (cx + 60.0, cy));
+        assert_eq!(app.state.playlist_bar_w, z0, "returning to the baseline restores its zoom");
+        assert!(app.scrolled.is_none(), "a zoom change repaints instead of blitting old pixels");
+        app.touch_pinch((cx - 75.0, cy + 7.0), (cx + 105.0, cy + 7.0));
+        assert_eq!(app.state.playlist_bar_w, z1);
+        app.touch_pinch_end();
+
+        // A fresh vertical pinch changes track height, not time zoom.
+        let row0 = app.state.playlist.row_h;
+        assert!(app.touch_pinch_start((cx, cy - 40.0), (cx, cy + 40.0)));
+        app.touch_pinch((cx, cy - 60.0), (cx, cy + 60.0));
+        app.touch_pinch((cx - 9.0, cy - 79.0), (cx - 9.0, cy + 101.0));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Vertical));
+        assert_eq!(app.state.playlist.row_h, (row0 * 1.5 / 2.0).round() * 2.0);
+        assert_eq!(app.state.playlist_bar_w, z1);
+        app.touch_pinch((cx, cy - 9000.0), (cx, cy + 9000.0));
+        assert_eq!(app.state.playlist.row_h, crate::playlist::ROW_MAX);
+    }
+
+    /// Piano-roll pinches follow the same rules, including midpoint panning on the non-zoom axis.
+    #[test]
+    fn piano_pinch_zooms_and_pans() {
+        let (mut app, _) = piano_with_note(64);
+        app.state.piano.tool = piano::Tool::Select;
+        let g = app.piano_geom().expect("piano geometry");
+        let (cx, cy) = (g.grid.cx(), g.grid.cy());
+        let note = piano::notes(&app.state.session)[0];
+        let r = g.note_rect(&note).expect("note rect");
+        assert!(app.touch_pinch_start((r.cx(), r.cy()), (r.cx(), (r.cy() + 20.0).min(g.grid.bottom() - 1.0))), "a note does not block a two-finger gesture");
+        app.touch_pinch_end();
+        let row0 = app.state.piano.row_h;
+        let z0 = app.state.piano.px_per_beat;
+        assert!(app.touch_pinch_start((cx, cy - 40.0), (cx, cy + 40.0)));
+        app.touch_pinch((cx, cy - 60.0), (cx, cy + 60.0));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Vertical));
+        let x0 = app.scroll_get(Scroll::PianoX);
+        // Vertical separation 120 -> 180; the midpoint also moves right and up.
+        app.touch_pinch((cx + 12.0, cy - 98.0), (cx + 12.0, cy + 82.0));
+        let row1 = (row0 * 1.5).round().clamp(piano::MIN_ROW, piano::MAX_ROW);
+        assert_eq!(app.state.piano.row_h, row1);
+        assert_eq!(app.state.piano.px_per_beat, z0);
+        assert!((app.scroll_get(Scroll::PianoX) - (x0 - 12.0).max(0.0)).abs() < 0.01, "the midpoint pans horizontally too");
+        app.touch_pinch_end();
+
+        assert!(app.touch_pinch_start((cx - 50.0, cy), (cx + 50.0, cy)));
+        app.touch_pinch((cx - 60.0, cy), (cx + 60.0, cy));
+        app.touch_pinch((cx - 90.0, cy), (cx + 90.0, cy));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Horizontal));
+        assert!((app.state.piano.px_per_beat - z0 * 1.5).abs() < 0.001);
+        assert_eq!(app.state.piano.row_h, row1);
+        app.touch_pinch((cx - 9000.0, cy), (cx + 9000.0, cy));
+        assert_eq!(app.state.piano.px_per_beat, 1600.0);
+    }
+
+    /// Pinch takeover ends tool drags without performing their release-only actions.
+    #[test]
+    fn pinch_takeover_cancels_release_only_tool_actions() {
+        let (mut app, _) = piano_with_note(64);
+        let g = app.piano_geom().expect("piano geometry");
+        let notes = piano::notes(&app.state.session).len();
+        let (x, y) = (g.grid.x + 40.0, g.grid.y + 40.0);
+        app.state.piano.tool = piano::Tool::Slice;
+        app.mouse_move(x, y);
+        app.mouse_down();
+        assert!(matches!(app.drag, Some(Drag::Slice)));
+        app.touch_left_cancel();
+        assert_eq!(piano::notes(&app.state.session).len(), notes, "no slice on takeover");
+        assert!(app.drag.is_none() && app.state.piano.overlay.is_none());
+
+        app.state.piano.tool = piano::Tool::Zoom;
+        let zoom = app.state.piano.px_per_beat;
+        app.mouse_move(x, y);
+        app.mouse_down();
+        app.mouse_move(x + 100.0, y + 60.0);
+        app.touch_left_cancel();
+        assert_eq!(app.state.piano.px_per_beat, zoom, "no zoom box on takeover");
+        assert!(app.drag.is_none() && app.state.piano.overlay.is_none());
+    }
+
+    /// An ambiguous diagonal changes only the midpoint scroll; clear intent is required before zooming.
+    #[test]
+    fn diagonal_pinch_pans_without_zooming() {
+        let mut app = App::new(None);
+        app.pl_grid = Some(Rect::new(0.0, 0.0, 800.0, 600.0));
+        app.hits.push(Hit { rect: Rect::new(0.0, 0.0, 800.0, 600.0), action: Action::PlaylistArea, hint: Cow::Borrowed(""), win: None, menu: 0, reveal: None });
+        app.state.playlist_scroll = (100.0, 100.0);
+        let before = (app.state.playlist_bar_w, app.state.playlist.row_h);
+        assert!(app.touch_pinch_start((300.0, 200.0), (400.0, 300.0)));
+        app.touch_pinch((312.0, 191.0), (412.0, 291.0));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), None);
+        assert_eq!((app.state.playlist_bar_w, app.state.playlist.row_h), before);
+        assert_eq!(app.state.playlist_scroll, (88.0, 109.0));
+        app.touch_pinch_end();
+
+        // Sub-pixel events are measured from the anchor, rather than rounded away one by one.
+        app.state.playlist_scroll = (100.0, 100.0);
+        assert!(app.touch_pinch_start((300.0, 200.0), (400.0, 300.0)));
+        for i in 1..=10 {
+            let d = i as f32 * 0.4;
+            app.touch_pinch((300.0 + d, 200.0), (400.0 + d, 300.0));
+        }
+        assert!((app.state.playlist_scroll.0 - 96.0).abs() < 0.001);
+    }
+
+    /// Settings pages pan from their background, but a slider keeps its drag.
+    #[test]
+    fn touch_pan_scrolls_settings_but_not_its_controls() {
+        use crate::views::settings::{self, SAct};
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.open_settings(settings::GENERAL);
+        frame(&mut app, &mut c, None);
+        assert!(app.can_scroll(Scroll::Settings), "the General page is taller than its window");
+        let body = hit_rect(&app, &Action::Settings(SAct::Body));
+        let p = (body.x + 6.0, body.bottom() - 6.0);
+        assert_eq!(app.top_hit(p.0, p.1).map(|h| h.action.clone()), Some(Action::Settings(SAct::Body)));
+        app.mouse_move(p.0, p.1);
+        assert!(app.touch_pan((0.0, 20.0)));
+        app.touch_pan_cancel();
+        if let Some((a, r)) = app.hits.iter().rev().find(|h| matches!(h.action, Action::Settings(SAct::Slider(..)))).map(|h| (h.action.clone(), h.rect)) {
+            app.mouse_move(r.cx(), r.cy());
+            assert_eq!(app.top_hit(r.cx(), r.cy()).map(|h| h.action.clone()), Some(a));
+            assert!(!app.touch_pan((0.0, 20.0)), "a slider keeps its drag");
+        }
+    }
+
+    /// The browser has no scroll bar: its own list scroll target clamps at both ends.
+    #[test]
+    fn browser_scroll_clamps_at_both_ends() {
+        let mut app = App::new(None);
+        assert_eq!(app.scroll_get(Scroll::Browser), 0.0);
+        let max = crate::views::browser::max_scroll(&app.state);
+        app.scroll_set(Scroll::Browser, 1e9);
+        assert_eq!(app.scroll_get(Scroll::Browser), max);
+        app.scroll_set(Scroll::Browser, -1.0);
+        assert_eq!(app.scroll_get(Scroll::Browser), 0.0);
+    }
+
+    /// A browser row pans vertically but keeps its sideways sample drag; the rack has no horizontal touch pan.
+    #[test]
+    fn touch_pan_browser_direction_and_rack_axis() {
+        let mut app = App::new(None);
+        let hit = |app: &mut App, action: Action| {
+            app.hits.clear();
+            app.hits.push(Hit { rect: Rect::new(0.0, 0.0, 100.0, 100.0), action, hint: Cow::Borrowed(""), win: None, menu: 0, reveal: None });
+            app.mouse_move(50.0, 50.0);
+        };
+        app.state.screen.1 = 180.0;
+        assert!(crate::views::browser::max_scroll(&app.state) > 0.0);
+        hit(&mut app, Action::BrowserRow(0));
+        assert!(!app.touch_pan((20.0, 0.0)), "sideways keeps the sample drag");
+        assert!(app.drag.is_none());
+        assert!(app.touch_pan((0.0, 20.0)), "up and down scrolls");
+        app.mouse_move(50.0, 20.0);
+        assert!(app.scroll_get(Scroll::Browser) > 0.0);
+        app.mouse_up();
+        assert!(app.glide.is_none(), "the threshold-crossing move alone is not a fling");
+
+        app.bars.push(Bar { target: Scroll::RackY, track: Rect::new(0.0, 0.0, 10.0, 100.0), vertical: true, max: 400.0, view: 100.0, thumb: 10.0 });
+        hit(&mut app, Action::RackArea);
+        assert!(app.touch_pan((20.0, 0.0)));
+        let Some(Drag::Scroll { axes, .. }) = &app.drag else { panic!("the rack pans") };
+        assert_eq!(axes.len(), 1);
+        assert_eq!((axes[0].0, axes[0].1), (Scroll::RackY, true));
+        app.mouse_move(100.0, 50.0);
+        assert_eq!((app.scroll_get(Scroll::RackX), app.scroll_get(Scroll::RackY)), (0.0, 0.0), "sideways moves nothing");
+    }
+
+    /// A touch pan's glide moves the view on after the finger lifts, and an edge stops it.
+    #[test]
+    fn a_touch_pan_glides_and_stops_at_the_edge() {
+        let mut app = App::new(None);
+        app.bars.push(Bar { target: Scroll::Settings, track: Rect::new(0.0, 0.0, 10.0, 100.0), vertical: true, max: 2000.0, view: 100.0, thumb: 10.0 });
+        app.state.settings.scroll = 500.0;
+        let t0 = Instant::now();
+        app.glide = Some(Glide { axes: vec![(Scroll::Settings, 1.0, 0.0)], at: t0, on: None });
+        app.glide_tick(t0 + std::time::Duration::from_millis(16));
+        assert!(app.state.settings.scroll > 500.0 && app.glide.is_some(), "it coasts on");
+        app.state.settings.scroll = 2000.0;
+        app.glide = Some(Glide { axes: vec![(Scroll::Settings, 1.0, 0.0)], at: t0, on: None });
+        app.glide_tick(t0 + std::time::Duration::from_millis(16));
+        assert_eq!(app.state.settings.scroll, 2000.0);
+        assert!(app.glide.is_none(), "an edge ends the glide");
+    }
+
+    /// A detached surface's glide is bounded by that surface's bars, not the main window's.
+    #[test]
+    fn a_detached_touch_pan_glide_uses_its_own_limits() {
+        let mut app = App::new(None);
+        app.state.raise(Win::Mixer);
+        app.set_detached(Win::Mixer, true);
+        let (_, h) = app.state.detached_size(Win::Mixer).expect("detached mixer size");
+        app.set_detached_size(Win::Mixer, (400.0, h));
+        let (w, h) = app.state.detached_size(Win::Mixer).expect("detached mixer size");
+        let Ok(mut c) = Canvas::new(w as u32, h as u32, 1.0) else { return };
+        app.paint_detached(Win::Mixer, &mut c);
+        let max = app.on_surface(Win::Mixer, |a| a.bar(Scroll::MixerX).map(|b| b.max)).expect("the mixer scrolls");
+        assert!(max > 0.0);
+        app.state.mixer_scroll = max;
+        let t0 = Instant::now();
+        app.glide = Some(Glide { axes: vec![(Scroll::MixerX, 1.0, 0.0)], at: t0, on: Some(Win::Mixer) });
+        app.glide_tick(t0 + std::time::Duration::from_millis(16));
+        assert_eq!(app.state.mixer_scroll, max);
+        assert!(app.glide.is_none());
     }
 
     /// An audio clip's Make unique gives it a copy of its channel; Make unique as sample renders it as it sounds (here at
