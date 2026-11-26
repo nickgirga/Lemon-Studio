@@ -15,6 +15,8 @@ mod plugin_rebuild;
 mod macos;
 #[cfg(target_os = "macos")]
 mod menu_bar;
+#[cfg(target_os = "linux")]
+mod osk;
 mod splash;
 mod touch;
 #[cfg(all(target_os = "macos", feature = "plugin-windows"))]
@@ -42,6 +44,8 @@ use winit::window::{CursorGrabMode, CursorIcon, ResizeDirection, Window, WindowI
 use app::App;
 use os_ui::Canvas;
 use touch::{TouchGesture, TouchStage};
+#[cfg(target_os = "linux")]
+use osk::KdeOsk;
 #[cfg(target_os = "linux")]
 use touch::Kde;
 
@@ -103,6 +107,8 @@ struct Shell {
     pointer: Option<(WindowId, (f64, f64))>,
     #[cfg(target_os = "linux")]
     kde: Kde,
+    #[cfg(target_os = "linux")]
+    osk: KdeOsk,
 }
 
 /// Frame timing for tuning (`OS_FRAMES=<file>`): per frame the time, what was repainted (`full` or the number of
@@ -646,6 +652,11 @@ impl Shell {
         }
         self.pending |= self.app.tick();
         self.sync_detached(el);
+        #[cfg(target_os = "linux")]
+        {
+            self.osk_sync(self.app.auto_close.main_focused && self.app.text_input_active());
+            self.app.state.osk = self.osk.activated;
+        }
         // The startup splash: the opened project's loading moves its gauge on; once the main window has shown and
         // nothing is loading, it finishes. It is dropped when it has faded away.
         if let Some(s) = &self.splash {
@@ -817,6 +828,8 @@ impl ApplicationHandler for Shell {
     /// (`macos::answer_quit`) ends the process from AppKit, after this: the plugin windows close and the instances go as
     /// they do when `run_app` returns.
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        #[cfg(target_os = "linux")]
+        self.osk_hide();
         // An update to install: the updater waits for this process to end (`update`).
         self.app.updates.on_exit();
         if let Some(window) = self.window.clone() {
@@ -2036,6 +2049,8 @@ pub fn run() {
         pointer: None,
         #[cfg(target_os = "linux")]
         kde: Kde::default(),
+        #[cfg(target_os = "linux")]
+        osk: KdeOsk::default(),
     };
     #[cfg(unix)]
     stop_signal::install();

@@ -1232,6 +1232,8 @@ pub struct State {
     pub wins: [WinState; 3],
     /// Size of the shell window in logical pixels (set each paint).
     pub screen: (f32, f32),
+    /// KDE's on-screen keyboard is active: floating text boxes use the window's top half.
+    pub osk: bool,
     /// The main window's monitor's own scale (device pixels per logical one, whatever Main GUI scaling says; set at
     /// every window event): General ▸ Display's PPI ruler follows it (`crate::ppi`).
     pub display_scale: f32,
@@ -1261,6 +1263,11 @@ pub struct State {
 }
 
 impl State {
+    /// A floating text box's vertical place while KDE's on-screen keyboard is up, else its usual place.
+    pub fn osk_y(&self, y: f32, h: f32) -> f32 {
+        if self.osk { (self.screen.1 - h) / 4.0 } else { y }
+    }
+
     /// Tells the motions which menus are closed now (Motion::menus_closed): on every tick and before every paint, so
     /// what closed is known while the canvas still shows it.
     pub fn note_closed_menus(&mut self) {
@@ -1677,6 +1684,7 @@ impl App {
                 pat_ui: Default::default(),
                 wins: crate::arrange::default_wins(),
                 screen: (1920.0, 1080.0),
+                osk: false,
                 display_scale: 1.0,
                 ui_scale: 1.0,
                 dialogs: Vec::new(),

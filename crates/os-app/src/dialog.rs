@@ -446,6 +446,29 @@ impl App {
         !self.state.dialogs.is_empty()
     }
 
+    /// Whether the keyboard belongs in a text field (the shell asks the desktop for an on-screen one on touch input).
+    pub fn text_input_active(&self) -> bool {
+        let s = &self.state;
+        if let Some(m) = s.dialogs.last() {
+            use crate::project_forms::Form;
+            return match &m.body {
+                Body::File(_) => true,
+                Body::Project(Form::Rename(_) | Form::Save(_) | Form::Export(_)) => true,
+                _ => false,
+            };
+        }
+        let settings = &s.settings;
+        s.playlist.edit.is_some()
+            || (s.show_browser && s.browser_search_focus)
+            || (settings.open && settings.tab == crate::views::settings::PLUGINS && s.plugdb.finding)
+            || (settings.open && settings.tab == crate::views::settings::INFO && settings.info_edit.is_some())
+            || (settings.open && settings.tab == crate::views::settings::FILE && settings.folder_edit.is_some())
+            || (settings.open && settings.tab == crate::views::settings::THEME && self.name_editing())
+            || s.pat_ui.name_box.is_some()
+            || s.perf.finding
+            || crate::plugin_palette::has_keys(s)
+    }
+
     /// Shows a message box over everything.
     pub fn show_msg(&mut self, m: Msg) {
         self.state.dialogs.push(Modal::new(Body::Msg(m)));
