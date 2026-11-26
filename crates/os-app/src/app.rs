@@ -461,6 +461,25 @@ struct Glide {
     on: Option<Win>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinchAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// A two-finger editor gesture: its midpoint pans, while separation along one clear direction zooms.
+struct Pinch {
+    target: Win,
+    from: [(f32, f32); 2],
+    axis: Option<PinchAxis>,
+    span: f32,
+    /// The view and content under the midpoint when panning or zooming was anchored.
+    middle: (f32, f32),
+    scroll: (f32, f32),
+    zoom: (f32, f32),
+    content: (f32, f32),
+}
+
 /// The time constant of a pan's glide (ms): it loses all but 1/e of its speed in this time.
 const GLIDE_MS: f32 = 110.0;
 /// Below this speed a glide stops (content px/ms).
@@ -1506,6 +1525,8 @@ pub struct App {
     /// A touch or stylus pan in progress, and its glide after the finger lifts.
     pan: Option<Pan>,
     glide: Option<Glide>,
+    /// A two-finger playlist or piano-roll gesture.
+    pinch: Option<Pinch>,
     /// A held click that has not moved yet (Click-and-hold & special gesture functions, `crate::hold`).
     pub hold: Option<crate::hold::Hold>,
     /// Views easing to where the wheel sent them (General ▸ Display ▸ Smoothing, `crate::smooth`).
@@ -1774,6 +1795,7 @@ impl App {
             drag: None,
             pan: None,
             glide: None,
+            pinch: None,
             hold: None,
             smooth: Default::default(),
             warp: None,
@@ -6862,6 +6884,219 @@ impl App {
         if self.glide.take().is_some() {
             self.invalidate();
         }
+    }
+
+    /// Start a two-finger editor gesture when both points are over the same playlist or piano-roll grid.
+    pub fn touch_pinch_start(&mut self, a: (f32, f32), b: (f32, f32)) -> bool {
+        if self.modal_open()
+            || self.state.menu_open.is_some()
+            || self.state.playlist.popup.is_some()
+            || self.state.lane_menu
+            || crate::typein_ui::is_open(&self.state)
+            || crate::remote_ui::is_open(&self.state)
+        {
+            return false;
+        }
+        let target = |(x, y): (f32, f32)| match self.top_hit(x, y).map(|h| &h.action) {
+            Some(Action::PlaylistArea) => Some(Win::Playlist),
+            Some(Action::PianoGrid | Action::PianoNote(_)) => Some(Win::PianoRoll),
+            _ => None,
+        };
+        let Some(target) = target(a).filter(|&t| target(b) == Some(t)) else { return false };
+        self.smooth.stop();
+        self.glide = None;
+        let (x, y, zoom) = match target {
+            Win::Playlist => (Scroll::PlaylistX, Scroll::PlaylistY, (self.state.playlist_bar_w, self.state.playlist.row_h)),
+            Win::PianoRoll => (Scroll::PianoX, Scroll::PianoY, (self.state.piano.px_per_beat, self.state.piano.row_h)),
+            _ => return false,
+        };
+        let scroll = (self.scroll_get(x), self.scroll_get(y));
+        let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        self.pinch = Some(Pinch { target, from: [a, b], axis: None, span: 0.0, middle, scroll, zoom, content: (0.0, 0.0) });
+        true
+    }
+
+    /// Move a two-finger editor gesture. The midpoint pans on both axes; only clear horizontal or vertical separation
+    /// zooms, and that zoom axis is then held until the gesture ends.
+    pub fn touch_pinch(&mut self, a: (f32, f32), b: (f32, f32)) {
+        let Some(mut p) = self.pinch.take() else { return };
+        let new = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let spans = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).abs(), (a.1 - b.1).abs());
+        let (sx, sy) = spans(a, b);
+        if p.axis.is_none() {
+            let (sx0, sy0) = spans(p.from[0], p.from[1]);
+            let horizontal = sx >= sy * 2.0 && (sx - sx0).abs() >= crate::hold::SLOP;
+            let vertical = sy >= sx * 2.0 && (sy - sy0).abs() >= crate::hold::SLOP;
+            if horizontal || vertical {
+                p.axis = Some(if horizontal { PinchAxis::Horizontal } else { PinchAxis::Vertical });
+                p.span = if horizontal { sx } else { sy };
+                p.middle = new;
+                let (x, y, zoom) = match p.target {
+                    Win::Playlist => (Scroll::PlaylistX, Scroll::PlaylistY, (self.state.playlist_bar_w, self.state.playlist.row_h)),
+                    Win::PianoRoll => (Scroll::PianoX, Scroll::PianoY, (self.state.piano.px_per_beat, self.state.piano.row_h)),
+                    _ => return,
+                };
+                p.scroll = (self.scroll_get(x), self.scroll_get(y));
+                p.zoom = zoom;
+                p.content = self.pinch_content(p.target, new);
+            }
+        }
+        let ratio = match (p.axis, p.span) {
+            (Some(PinchAxis::Horizontal), span) if span > 0.0 => sx / span,
+            (Some(PinchAxis::Vertical), span) if span > 0.0 => sy / span,
+            _ => 1.0,
+        };
+        self.pinch_move(&p, new, ratio);
+        self.pinch = Some(p);
+    }
+
+    /// Time and row content at a gesture's anchor, in the units each editor's zoom uses.
+    fn pinch_content(&self, target: Win, at: (f32, f32)) -> (f32, f32) {
+        match target {
+            Win::Playlist => {
+                let Some(grid) = self.pl_grid else { return (0.0, 0.0) };
+                let x = (self.state.playlist_scroll.0 + at.0 - grid.x) / self.state.playlist_bar_w;
+                let rows = crate::playlist::Rows::new(&self.state);
+                let cy = (self.state.playlist_scroll.1 + at.1 - grid.y).max(0.0);
+                let t = rows.at(cy);
+                let frac = ((cy - rows.top(t)) / rows.height(t).max(1.0)).clamp(0.0, 1.0);
+                (x, f32::from(t) + frac)
+            }
+            Win::PianoRoll => {
+                let Some(g) = self.piano_geom() else { return (0.0, 0.0) };
+                (g.tick_at(at.0), (self.state.piano.scroll_y + at.1 - g.grid.y) / self.state.piano.row_h)
+            }
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// Keep a zooming axis's existing scroll bar in step before clamping its new position.
+    fn pinch_bar_zoom(&mut self, t: Scroll, old: f32, new: f32) {
+        if let Some(b) = self.bars.iter_mut().find(|b| b.target == t).filter(|_| old > 0.0) {
+            b.max = ((b.max + b.view) * (new / old) - b.view).max(0.0);
+        }
+    }
+
+    /// Apply the whole gesture from its anchor, not rounded increments: slow midpoint motion is never lost.
+    fn pinch_move(&mut self, p: &Pinch, new: (f32, f32), ratio: f32) {
+        let (mut x, mut y) = (p.scroll.0 - (new.0 - p.middle.0), p.scroll.1 - (new.1 - p.middle.1));
+        match p.target {
+            Win::Playlist => {
+                let Some(grid) = self.pl_grid else { return };
+                let old = (self.state.playlist_bar_w, self.state.playlist.row_h);
+                match p.axis {
+                    Some(PinchAxis::Horizontal) => {
+                        let z = (p.zoom.0 * ratio).clamp(4.0, 600.0);
+                        self.state.playlist_bar_w = z;
+                        self.pinch_bar_zoom(Scroll::PlaylistX, old.0, z);
+                        x = p.content.0 * z - (new.0 - grid.x);
+                    }
+                    Some(PinchAxis::Vertical) => {
+                        self.state.playlist.row_h = ((p.zoom.1 * ratio / 2.0).round() * 2.0).clamp(crate::playlist::ROW_MIN, crate::playlist::ROW_MAX);
+                        let rows = crate::playlist::Rows::new(&self.state);
+                        if let Some(b) = self.bars.iter_mut().find(|b| b.target == Scroll::PlaylistY) {
+                            b.max = (rows.total() - b.view).max(0.0);
+                        }
+                        let t = p.content.1.max(0.0).trunc() as u16;
+                        y = rows.top(t) + p.content.1.fract() * rows.height(t) - (new.1 - grid.y);
+                    }
+                    None => {}
+                }
+                let zoomed = match p.axis {
+                    Some(PinchAxis::Horizontal) => self.state.playlist_bar_w != old.0,
+                    Some(PinchAxis::Vertical) => self.state.playlist.row_h != old.1,
+                    None => false,
+                };
+                if zoomed {
+                    self.scroll_set(Scroll::PlaylistX, x);
+                    self.scroll_set(Scroll::PlaylistY, y);
+                    self.damage_win(Win::Playlist);
+                } else {
+                    self.apply_scroll(Scroll::PlaylistX, x);
+                    self.apply_scroll(Scroll::PlaylistY, y);
+                }
+            }
+            Win::PianoRoll => {
+                let Some(g) = self.piano_geom() else { return };
+                let old = (self.state.piano.px_per_beat, self.state.piano.row_h);
+                match p.axis {
+                    Some(PinchAxis::Horizontal) => {
+                        let z = (p.zoom.0 * ratio).clamp(6.0, 1600.0);
+                        self.state.piano.px_per_beat = z;
+                        let ppt = z / f32::from(self.state.session.project.ppq.max(4));
+                        x = p.content.0 * ppt - (new.0 - g.grid.x);
+                        // PianoX's span depends on the view and proposed scroll, not just the old zoom (`views::piano`).
+                        let view = g.grid.w / ppt;
+                        let len = crate::edit::notes::pattern_length(&self.state.session, self.state.pattern()) as f32;
+                        let span = self.state.piano.bar_span.unwrap_or(len.max((x / ppt).max(0.0) + view) + view / 2.0);
+                        if let Some(b) = self.bars.iter_mut().find(|b| b.target == Scroll::PianoX) {
+                            b.max = (span * ppt - b.view).max(0.0);
+                        }
+                    }
+                    Some(PinchAxis::Vertical) => {
+                        let row = (p.zoom.1 * ratio).round().clamp(piano::MIN_ROW, piano::MAX_ROW);
+                        self.state.piano.row_h = row;
+                        self.pinch_bar_zoom(Scroll::PianoY, old.1, row);
+                        y = p.content.1 * row - (new.1 - g.grid.y);
+                    }
+                    None => {}
+                }
+                let zoomed = match p.axis {
+                    Some(PinchAxis::Horizontal) => self.state.piano.px_per_beat != old.0,
+                    Some(PinchAxis::Vertical) => self.state.piano.row_h != old.1,
+                    None => false,
+                };
+                if zoomed {
+                    self.scroll_set(Scroll::PianoX, x);
+                    self.scroll_set(Scroll::PianoY, y);
+                    piano::clamp_scroll(&mut self.state, g.grid.h);
+                    self.damage_win(Win::PianoRoll);
+                } else {
+                    self.apply_scroll(Scroll::PianoX, x);
+                    self.apply_scroll(Scroll::PianoY, y);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One finger lifted: the remaining one stays inert until it lifts too.
+    pub fn touch_pinch_end(&mut self) {
+        self.pinch = None;
+    }
+
+    /// A second finger took over a left drag: stop it without running release-only actions (slice, zoom box or drop).
+    pub fn touch_left_cancel(&mut self) {
+        self.pan = None;
+        self.hold = None;
+        self.shift_clone = false;
+        self.scrub_release();
+        self.hold_key(None, false);
+        self.armed = None;
+        self.armed_right = None;
+        self.pressed = None;
+        self.raise_at = None;
+        if self.cross_drag() {
+            self.browser_cancel();
+        }
+        match self.drag.take() {
+            Some(Drag::Pl(d)) => {
+                if let Some(grid) = self.pl_grid {
+                    crate::playlist::drag_cancel(self, d, grid);
+                }
+            }
+            Some(Drag::NoteMove { .. } | Drag::NoteResize { .. } | Drag::NoteErase | Drag::NoteMute { .. } | Drag::NotePaint { .. }) => {
+                piano::finish_edit(&mut self.state);
+                self.state.session.dirty = true;
+            }
+            Some(Drag::Velocity { .. }) => self.state.session.dirty = true,
+            Some(Drag::BarEdge { .. }) => self.state.piano.bar_span = None,
+            _ => {}
+        }
+        self.state.piano.overlay = None;
+        self.state.playlist.overlay = None;
+        crate::history::settle(&mut self.state.session);
+        self.invalidate();
     }
 
     /// A cancelled touch pan: stop at once, with no glide and no click.
@@ -20903,6 +21138,134 @@ mod tests {
         app.state.piano.tool = piano::Tool::Select;
         app.mouse_move(p.0, p.1);
         assert!(!app.touch_pan((0.0, 20.0)), "the Select tool keeps its box");
+    }
+
+    /// A playlist pinch pans with its midpoint and zooms only the clear separation axis.
+    #[test]
+    fn playlist_pinch_zooms_and_pans() {
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let (mut app, _, _, _) = ruler_app(&mut c);
+        app.state.playlist.tool = crate::playlist::PlTool::Select;
+        let grid = app.pl_grid.expect("playlist grid");
+        let (cx, cy) = (grid.cx(), grid.cy());
+        let z0 = app.state.playlist_bar_w;
+        let sx0 = app.state.playlist_scroll.0;
+        assert!(app.touch_pinch_start((cx - 50.0, cy), (cx + 50.0, cy)));
+        // Crossing the slop chooses horizontal zoom, but establishes its baseline without a zoom jump.
+        app.touch_pinch((cx - 60.0, cy), (cx + 60.0, cy));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Horizontal));
+        assert_eq!(app.state.playlist_bar_w, z0);
+        // Expand 120 -> 180 while the midpoint moves right and down.
+        app.touch_pinch((cx - 75.0, cy + 7.0), (cx + 105.0, cy + 7.0));
+        let z1 = z0 * 1.5;
+        let want_x = ((sx0 + cx - grid.x) / z0) * z1 - (cx - grid.x) - 15.0;
+        assert!((app.state.playlist_bar_w - z1).abs() < 0.001);
+        assert!((app.state.playlist_scroll.0 - want_x.max(0.0)).abs() < 0.001);
+        assert_eq!(app.state.playlist_scroll.1, 0.0, "seven pixels down clamps at the top");
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Horizontal), "the axis stays locked");
+        app.scrolled = None;
+        app.touch_pinch((cx - 60.0, cy), (cx + 60.0, cy));
+        assert_eq!(app.state.playlist_bar_w, z0, "returning to the baseline restores its zoom");
+        assert!(app.scrolled.is_none(), "a zoom change repaints instead of blitting old pixels");
+        app.touch_pinch((cx - 75.0, cy + 7.0), (cx + 105.0, cy + 7.0));
+        assert_eq!(app.state.playlist_bar_w, z1);
+        app.touch_pinch_end();
+
+        // A fresh vertical pinch changes track height, not time zoom.
+        let row0 = app.state.playlist.row_h;
+        assert!(app.touch_pinch_start((cx, cy - 40.0), (cx, cy + 40.0)));
+        app.touch_pinch((cx, cy - 60.0), (cx, cy + 60.0));
+        app.touch_pinch((cx - 9.0, cy - 79.0), (cx - 9.0, cy + 101.0));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Vertical));
+        assert_eq!(app.state.playlist.row_h, (row0 * 1.5 / 2.0).round() * 2.0);
+        assert_eq!(app.state.playlist_bar_w, z1);
+        app.touch_pinch((cx, cy - 9000.0), (cx, cy + 9000.0));
+        assert_eq!(app.state.playlist.row_h, crate::playlist::ROW_MAX);
+    }
+
+    /// Piano-roll pinches follow the same rules, including midpoint panning on the non-zoom axis.
+    #[test]
+    fn piano_pinch_zooms_and_pans() {
+        let (mut app, _) = piano_with_note(64);
+        app.state.piano.tool = piano::Tool::Select;
+        let g = app.piano_geom().expect("piano geometry");
+        let (cx, cy) = (g.grid.cx(), g.grid.cy());
+        let note = piano::notes(&app.state.session)[0];
+        let r = g.note_rect(&note).expect("note rect");
+        assert!(app.touch_pinch_start((r.cx(), r.cy()), (r.cx(), (r.cy() + 20.0).min(g.grid.bottom() - 1.0))), "a note does not block a two-finger gesture");
+        app.touch_pinch_end();
+        let row0 = app.state.piano.row_h;
+        let z0 = app.state.piano.px_per_beat;
+        assert!(app.touch_pinch_start((cx, cy - 40.0), (cx, cy + 40.0)));
+        app.touch_pinch((cx, cy - 60.0), (cx, cy + 60.0));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Vertical));
+        let x0 = app.scroll_get(Scroll::PianoX);
+        // Vertical separation 120 -> 180; the midpoint also moves right and up.
+        app.touch_pinch((cx + 12.0, cy - 98.0), (cx + 12.0, cy + 82.0));
+        let row1 = (row0 * 1.5).round().clamp(piano::MIN_ROW, piano::MAX_ROW);
+        assert_eq!(app.state.piano.row_h, row1);
+        assert_eq!(app.state.piano.px_per_beat, z0);
+        assert!((app.scroll_get(Scroll::PianoX) - (x0 - 12.0).max(0.0)).abs() < 0.01, "the midpoint pans horizontally too");
+        app.touch_pinch_end();
+
+        assert!(app.touch_pinch_start((cx - 50.0, cy), (cx + 50.0, cy)));
+        app.touch_pinch((cx - 60.0, cy), (cx + 60.0, cy));
+        app.touch_pinch((cx - 90.0, cy), (cx + 90.0, cy));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), Some(PinchAxis::Horizontal));
+        assert!((app.state.piano.px_per_beat - z0 * 1.5).abs() < 0.001);
+        assert_eq!(app.state.piano.row_h, row1);
+        app.touch_pinch((cx - 9000.0, cy), (cx + 9000.0, cy));
+        assert_eq!(app.state.piano.px_per_beat, 1600.0);
+    }
+
+    /// Pinch takeover ends tool drags without performing their release-only actions.
+    #[test]
+    fn pinch_takeover_cancels_release_only_tool_actions() {
+        let (mut app, _) = piano_with_note(64);
+        let g = app.piano_geom().expect("piano geometry");
+        let notes = piano::notes(&app.state.session).len();
+        let (x, y) = (g.grid.x + 40.0, g.grid.y + 40.0);
+        app.state.piano.tool = piano::Tool::Slice;
+        app.mouse_move(x, y);
+        app.mouse_down();
+        assert!(matches!(app.drag, Some(Drag::Slice)));
+        app.touch_left_cancel();
+        assert_eq!(piano::notes(&app.state.session).len(), notes, "no slice on takeover");
+        assert!(app.drag.is_none() && app.state.piano.overlay.is_none());
+
+        app.state.piano.tool = piano::Tool::Zoom;
+        let zoom = app.state.piano.px_per_beat;
+        app.mouse_move(x, y);
+        app.mouse_down();
+        app.mouse_move(x + 100.0, y + 60.0);
+        app.touch_left_cancel();
+        assert_eq!(app.state.piano.px_per_beat, zoom, "no zoom box on takeover");
+        assert!(app.drag.is_none() && app.state.piano.overlay.is_none());
+    }
+
+    /// An ambiguous diagonal changes only the midpoint scroll; clear intent is required before zooming.
+    #[test]
+    fn diagonal_pinch_pans_without_zooming() {
+        let mut app = App::new(None);
+        app.pl_grid = Some(Rect::new(0.0, 0.0, 800.0, 600.0));
+        app.hits.push(Hit { rect: Rect::new(0.0, 0.0, 800.0, 600.0), action: Action::PlaylistArea, hint: Cow::Borrowed(""), win: None, menu: 0, reveal: None });
+        app.state.playlist_scroll = (100.0, 100.0);
+        let before = (app.state.playlist_bar_w, app.state.playlist.row_h);
+        assert!(app.touch_pinch_start((300.0, 200.0), (400.0, 300.0)));
+        app.touch_pinch((312.0, 191.0), (412.0, 291.0));
+        assert_eq!(app.pinch.as_ref().and_then(|p| p.axis), None);
+        assert_eq!((app.state.playlist_bar_w, app.state.playlist.row_h), before);
+        assert_eq!(app.state.playlist_scroll, (88.0, 109.0));
+        app.touch_pinch_end();
+
+        // Sub-pixel events are measured from the anchor, rather than rounded away one by one.
+        app.state.playlist_scroll = (100.0, 100.0);
+        assert!(app.touch_pinch_start((300.0, 200.0), (400.0, 300.0)));
+        for i in 1..=10 {
+            let d = i as f32 * 0.4;
+            app.touch_pinch((300.0 + d, 200.0), (400.0 + d, 300.0));
+        }
+        assert!((app.state.playlist_scroll.0 - 96.0).abs() < 0.001);
     }
 
     /// Settings pages pan from their background, but a slider keeps its drag.
