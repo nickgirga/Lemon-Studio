@@ -786,6 +786,14 @@ impl App {
         }
     }
 
+    /// The file list's current and maximum scroll, for touch panning.
+    pub(crate) fn file_scroll(&self) -> (f32, f32) {
+        match &self.state.dialogs.last().map(|m| &m.body) {
+            Some(Body::File(f)) => (f.scroll, f.max_scroll()),
+            _ => (0.0, 0.0),
+        }
+    }
+
     /// Drags the file list's scroll bar.
     pub fn dialog_scroll(&mut self, scroll: f32) {
         if let Some(f) = self.top_file() {

@@ -380,6 +380,8 @@ pub enum Scroll {
     Palette,
     /// The browser's list, which has no scroll bar.
     Browser,
+    /// The file dialog's list.
+    FileDialog,
 }
 
 /// A scroll bar painted this frame.
@@ -492,7 +494,7 @@ pub fn scroll_win(t: Scroll) -> Option<Win> {
         Scroll::RackX | Scroll::RackY => Some(Win::ChannelRack),
         Scroll::Palette => Some(Win::PluginPalette),
         Scroll::Browser => Some(Win::Browser),
-        Scroll::Settings | Scroll::PlugTable | Scroll::Popup | Scroll::PopupSub => None,
+        Scroll::Settings | Scroll::PlugTable | Scroll::Popup | Scroll::PopupSub | Scroll::FileDialog => None,
     }
 }
 
@@ -6571,6 +6573,7 @@ impl App {
             Scroll::PlugTable => s.plugdb.top as f32 * views::settings::TABLE_ROW_H,
             Scroll::Palette => s.palette.scroll,
             Scroll::Browser => s.browser_scroll,
+            Scroll::FileDialog => self.file_scroll().0,
             Scroll::Popup | Scroll::PopupSub => s.playlist.popup.as_ref().map_or(0.0, |p| p.scroll[usize::from(t == Scroll::PopupSub)] as f32),
         }
     }
@@ -6579,6 +6582,10 @@ impl App {
     pub fn scroll_set(&mut self, t: Scroll, v: f32) {
         let max = self.scroll_max(t);
         let v = v.clamp(0.0, max.max(0.0));
+        if t == Scroll::FileDialog {
+            self.dialog_scroll(v);
+            return;
+        }
         let s = &mut self.state;
         match t {
             Scroll::PianoX => s.piano.scroll_x = v / (s.piano.px_per_beat / f32::from(s.session.project.ppq.max(4))),
@@ -6594,6 +6601,7 @@ impl App {
             Scroll::PlugTable => s.plugdb.top = (v / views::settings::TABLE_ROW_H).round() as usize,
             Scroll::Palette => s.palette.scroll = v,
             Scroll::Browser => s.browser_scroll = v,
+            Scroll::FileDialog => unreachable!("handled before borrowing the state"),
             Scroll::Popup | Scroll::PopupSub => {
                 let Some(p) = s.playlist.popup.as_mut() else { return };
                 let (k, col) = (usize::from(t == Scroll::PopupSub), v.round() as usize);
@@ -6611,6 +6619,9 @@ impl App {
     fn scroll_max(&self, t: Scroll) -> f32 {
         if t == Scroll::Browser {
             return crate::views::browser::max_scroll(&self.state);
+        }
+        if t == Scroll::FileDialog {
+            return self.file_scroll().1;
         }
         let unbounded = if matches!(t, Scroll::RackX | Scroll::RackY) { 0.0 } else { f32::MAX };
         self.bar(t).map_or(unbounded, |b| b.max)
@@ -6721,6 +6732,7 @@ impl App {
     fn can_scroll(&self, t: Scroll) -> bool {
         match t {
             Scroll::Browser => crate::views::browser::max_scroll(&self.state) > 0.0,
+            Scroll::FileDialog => self.file_scroll().1 > 0.0,
             _ => self.bar(t).is_some_and(|b| b.max > 0.0),
         }
     }
@@ -6729,8 +6741,10 @@ impl App {
     /// there, instead of pressing and dragging what is under it. `delta` is how far the gesture has moved so far (a
     /// browser row scrolls up and down, while a sideways drag carries the sample out). Returns whether a pan started.
     pub fn touch_pan(&mut self, delta: (f32, f32)) -> bool {
-        // Menus, dialogs and value boxes keep their own drags and clicks.
-        if self.modal_open()
+        let (x, y) = self.mouse;
+        let file_list = matches!(self.top_hit(x, y).map(|h| &h.action), Some(Action::Dlg(crate::dialog::DHit::Row(_) | crate::dialog::DHit::List)));
+        // Menus, dialogs and value boxes keep their own drags and clicks, except the file dialog's list.
+        if (self.modal_open() && !file_list)
             || self.state.menu_open.is_some()
             || self.state.playlist.popup.is_some()
             || self.state.lane_menu
@@ -6739,7 +6753,6 @@ impl App {
         {
             return false;
         }
-        let (x, y) = self.mouse;
         let Some(action) = self.top_hit(x, y).map(|h| h.action.clone()) else { return false };
         let targets: &[(Scroll, bool)] = match &action {
             Action::PlaylistArea => {
@@ -6771,6 +6784,12 @@ impl App {
                     return false;
                 }
                 &[(Scroll::Browser, true)]
+            }
+            Action::Dlg(crate::dialog::DHit::Row(_) | crate::dialog::DHit::List) => {
+                if !self.modal_open() || delta.0.abs() > delta.1.abs() {
+                    return false;
+                }
+                &[(Scroll::FileDialog, true)]
             }
             Action::PlPick(_) | Action::PlPickList => &[(Scroll::PlPick, true)],
             // The rack scrolls up and down only, from its background and channel names: its controls keep their drags.
@@ -20940,6 +20959,40 @@ mod tests {
         assert_eq!((axes[0].0, axes[0].1), (Scroll::RackY, true));
         app.mouse_move(100.0, 50.0);
         assert_eq!((app.scroll_get(Scroll::RackX), app.scroll_get(Scroll::RackY)), (0.0, 0.0), "sideways moves nothing");
+    }
+
+    /// File-dialog rows and empty list space pan vertically; other dialog controls keep their input.
+    #[test]
+    fn touch_pan_scrolls_the_file_dialog_list() {
+        use crate::dialog::{Body, DHit, Modal, Then};
+        use crate::filedlg::{Entry, FileDlg, Mode, SortBy};
+        let mut app = App::new(None);
+        let mut f = FileDlg::new(Mode::Open, "Open", "test", Then::Nothing);
+        f.entries = (0..20).map(|i| Entry { name: format!("{i}.wav"), dir: false, size: 0, modified: None }).collect();
+        f.view.set(Rect::new(0.0, 0.0, 100.0, 100.0));
+        app.state.dialogs.push(Modal::new(Body::File(Box::new(f))));
+        let hit = |app: &mut App, action| {
+            app.hits.clear();
+            app.hits.push(Hit { rect: Rect::new(0.0, 0.0, 100.0, 100.0), action, hint: Cow::Borrowed(""), win: None, menu: 0, reveal: None });
+            app.mouse_move(50.0, 50.0);
+        };
+        hit(&mut app, Action::Dlg(DHit::Row(0)));
+        assert!(!app.touch_pan((20.0, 0.0)), "sideways does not scroll the list");
+        assert!(app.touch_pan((0.0, 20.0)));
+        app.mouse_move(50.0, 20.0);
+        assert_eq!(app.scroll_get(Scroll::FileDialog), 30.0);
+        app.touch_pan_cancel();
+        hit(&mut app, Action::Dlg(DHit::List));
+        assert!(app.touch_pan((0.0, 20.0)), "empty list space pans too");
+        app.touch_pan_cancel();
+        for action in [DHit::Bar, DHit::Header(SortBy::Name), DHit::Accept] {
+            hit(&mut app, Action::Dlg(action));
+            assert!(!app.touch_pan((0.0, 20.0)), "dialog controls keep their input");
+        }
+        app.scroll_set(Scroll::FileDialog, 1e9);
+        assert_eq!(app.scroll_get(Scroll::FileDialog), 300.0);
+        app.scroll_set(Scroll::FileDialog, -1.0);
+        assert_eq!(app.scroll_get(Scroll::FileDialog), 0.0);
     }
 
     /// Mixer strips pan sideways, while vertical selection drags and their controls keep their own behavior.
