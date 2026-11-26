@@ -13,7 +13,7 @@ use crate::typein::{self, Target, TiAct, H};
 
 pub fn paint(ui: &mut Ui, s: &State, e: &TextEdit, t: Target, norm: bool) {
     let th = ui.t;
-    let r = Rect::new(e.at.0, e.at.1, typein::width(t), H);
+    let r = Rect::new(e.at.0, s.osk_y(e.at.1, H), typein::width(t), H);
     ui.hit(r, Action::TypeIn(TiAct::Field), "Type, Enter accepts, Esc cancels");
     ui.c.fill_rect(r, th.s(0x1b1d1e));
     ui.c.stroke_rrect(r, 0.0, 1.0, th.s(0x607f8f));

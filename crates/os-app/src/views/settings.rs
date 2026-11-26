@@ -1149,7 +1149,8 @@ pub fn paint(ui: &mut Ui, s: &State) {
 /// The name panel over the Theme page (`crate::theme_library`): a title, the name box (not for Delete), OK and Cancel.
 fn name_panel(ui: &mut Ui, s: &State, e: &crate::theme_library::NameEdit, win: Rect) {
     let t = ui.t;
-    let (panel, field, ok, cancel) = crate::theme_library::name_rects(e, win);
+    let e = crate::theme_library::NameEdit { at: (e.at.0, s.osk_y(e.at.1, crate::theme_library::NAME_H)), ..e.clone() };
+    let (panel, field, ok, cancel) = crate::theme_library::name_rects(&e, win);
     let lemon = super::lemon(ui);
     let rad = if lemon { lk::r_panel(t) } else { 0.0 };
     ui.hit(panel, Action::Settings(SAct::NameBody), "");
