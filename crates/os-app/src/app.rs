@@ -6776,6 +6776,13 @@ impl App {
             // The rack scrolls up and down only, from its background and channel names: its controls keep their drags.
             Action::RackArea | Action::ChannelSelect(_) => &[(Scroll::RackY, true)],
             Action::MixerArea => &[(Scroll::MixerX, false)],
+            // A strip is the mixer's background, but only a clearly sideways drag pans: vertical selection drags stay.
+            Action::Mix(crate::mixer::MHit::Strip(_)) => {
+                if delta.0.abs() <= delta.1.abs() {
+                    return false;
+                }
+                &[(Scroll::MixerX, false)]
+            }
             Action::Palette(crate::plugin_palette::PalAct::List | crate::plugin_palette::PalAct::Row(_)) => &[(Scroll::Palette, true)],
             Action::Settings(a) => {
                 use crate::views::settings::{Plug, SAct};
@@ -20933,6 +20940,29 @@ mod tests {
         assert_eq!((axes[0].0, axes[0].1), (Scroll::RackY, true));
         app.mouse_move(100.0, 50.0);
         assert_eq!((app.scroll_get(Scroll::RackX), app.scroll_get(Scroll::RackY)), (0.0, 0.0), "sideways moves nothing");
+    }
+
+    /// Mixer strips pan sideways, while vertical selection drags and their controls keep their own behavior.
+    #[test]
+    fn touch_pan_mixer_strip_is_horizontal_only() {
+        let mut app = App::new(None);
+        app.bars.push(Bar { target: Scroll::MixerX, track: Rect::new(0.0, 0.0, 100.0, 10.0), vertical: false, max: 400.0, view: 100.0, thumb: 10.0 });
+        let hit = |app: &mut App, action: Action| {
+            app.hits.clear();
+            app.hits.push(Hit { rect: Rect::new(0.0, 0.0, 100.0, 100.0), action, hint: Cow::Borrowed(""), win: None, menu: 0, reveal: None });
+            app.mouse_move(50.0, 50.0);
+        };
+        use crate::mixer::MHit;
+        hit(&mut app, Action::Mix(MHit::Strip(1)));
+        assert!(!app.touch_pan((0.0, 20.0)), "a vertical drag keeps strip selection");
+        assert!(app.touch_pan((20.0, 0.0)));
+        app.mouse_move(20.0, 50.0);
+        assert_eq!(app.scroll_get(Scroll::MixerX), 30.0);
+        app.touch_pan_cancel();
+        for action in [Action::Fader(1), Action::Knob(crate::knobs::KnobId::MasterPitch)] {
+            hit(&mut app, action);
+            assert!(!app.touch_pan((20.0, 0.0)), "mixer controls keep their drags");
+        }
     }
 
     /// A touch pan's glide moves the view on after the finger lifts, and an edge stops it.
