@@ -16,6 +16,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod menu_bar;
 mod splash;
+mod touch;
 #[cfg(all(target_os = "macos", feature = "plugin-windows"))]
 mod window_check;
 mod winit_keys;
@@ -40,6 +41,9 @@ use winit::window::{CursorGrabMode, CursorIcon, ResizeDirection, Window, WindowI
 
 use app::App;
 use os_ui::Canvas;
+use touch::{TouchGesture, TouchStage};
+#[cfg(target_os = "linux")]
+use touch::Kde;
 
 struct Shell {
     app: App,
@@ -93,9 +97,12 @@ struct Shell {
     detached: Vec<detached_win::DetWin>,
     /// The key event being handled came to this detached window: it goes to the app on that window's surface.
     key_on: Option<app::Win>,
-    /// The finger or pen that stands in for the mouse, and where it last was (physical pixels in its window). The window
-    /// system reports a touch apart from the mouse and sends no mouse events for it (`touch_event`).
-    touch: Option<(u64, (f64, f64))>,
+    /// The undecided or active touch/stylus gesture (`touch_event`). Ordinary mouse input does not use it.
+    touch: Option<TouchGesture>,
+    /// The last pointer position in each window, for an X11 stylus that arrives as mouse events.
+    pointer: Option<(WindowId, (f64, f64))>,
+    #[cfg(target_os = "linux")]
+    kde: Kde,
 }
 
 /// Frame timing for tuning (`OS_FRAMES=<file>`): per frame the time, what was repainted (`full` or the number of
@@ -361,47 +368,116 @@ impl Shell {
         self.pending = true;
     }
 
-    /// A touch screen's finger or pen plays the left mouse button: the first one down moves the pointer there and
-    /// presses, its moves move the pointer, and lifting it (or the system cancelling it) releases. Other fingers down at
-    /// the same time do nothing. While a knob or scroll-bar drag holds the cursor (`lock`), the finger's moves drive it
-    /// as the mouse's raw motion would.
+    /// The first touch or stylus is undecided until it moves: a short tap is a left click, a move past the slop starts
+    /// the ordinary left drag. The left press is held back until then. Feature branches extend the undecided move and
+    /// release decisions without duplicating event identity, coordinates or stylus routing.
     fn touch_event(&mut self, el: &ActiveEventLoop, id: WindowId, touch: Touch) {
         let Touch { device_id, phase, location, id: finger, .. } = touch;
         let at = (location.x, location.y);
-        let moved = WindowEvent::CursorMoved { device_id, position: location };
-        let button = |state| WindowEvent::MouseInput { device_id, state, button: MouseButton::Left };
         match phase {
             TouchPhase::Started => {
                 if self.touch.is_some() {
                     return;
                 }
-                self.touch = Some((finger, at));
-                self.window_event(el, id, moved);
-                self.window_event(el, id, button(ElementState::Pressed));
+                self.touch = Some(TouchGesture { window: id, device: device_id, finger, from: at, last: at, at: Instant::now(), stage: TouchStage::Pending, mouse: false });
+                self.mouse_event(el, id, WindowEvent::CursorMoved { device_id, position: location });
             }
-            TouchPhase::Moved => {
-                let Some((held, last)) = self.touch else { return };
-                if held != finger {
-                    return;
-                }
-                self.touch = Some((finger, at));
-                if self.lock.is_some() {
-                    self.held_motion((at.0 - last.0, at.1 - last.1));
-                } else {
-                    self.window_event(el, id, moved);
-                }
+            TouchPhase::Moved if self.touch.is_some_and(|g| g.window == id && g.device == device_id && g.finger == finger) => self.touch_move(el, id, device_id, at),
+            TouchPhase::Ended if self.touch.is_some_and(|g| g.window == id && g.device == device_id && g.finger == finger) => self.touch_end(el, id, device_id, false),
+            TouchPhase::Cancelled if self.touch.is_some_and(|g| g.window == id && g.device == device_id && g.finger == finger) => self.touch_end(el, id, device_id, true),
+            _ => {}
+        }
+    }
+
+    /// An X11 stylus arrives as mouse input. Only KWin's own touch/tablet evidence defers it; a real mouse always goes
+    /// straight through (`mouse_event`). An active gesture also sees its own cursor moves and release here.
+    #[cfg(target_os = "linux")]
+    fn stylus_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::CursorMoved { device_id, position } if self.touch.is_some_and(|g| g.mouse && g.window == id && g.device == *device_id) => {
+                self.touch_move(el, id, *device_id, (position.x, position.y));
+                true
             }
-            TouchPhase::Ended | TouchPhase::Cancelled => {
-                if self.touch.is_none_or(|(held, _)| held != finger) {
-                    return;
+            WindowEvent::MouseInput { device_id, state: ElementState::Pressed, button: MouseButton::Left } => {
+                if self.touch.is_some() || !self.kde.stylus() {
+                    return false;
                 }
-                self.touch = None;
+                let Some((_, at)) = self.pointer.filter(|(window, _)| *window == id) else { return false };
+                self.touch = Some(TouchGesture { window: id, device: *device_id, finger: 0, from: at, last: at, at: Instant::now(), stage: TouchStage::Pending, mouse: true });
+                true
+            }
+            WindowEvent::MouseInput { device_id, state: ElementState::Released, button: MouseButton::Left }
+                if self.touch.is_some_and(|g| g.mouse && g.window == id && g.device == *device_id) =>
+            {
+                self.touch_end(el, id, *device_id, false);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A move while undecided keeps hovering; past the slop it starts the left drag. A committed drag moves by absolute
+    /// touch positions, or by deltas while a knob or scroll bar holds the cursor (`lock`).
+    fn touch_move(&mut self, el: &ActiveEventLoop, id: WindowId, device: DeviceId, at: (f64, f64)) {
+        let Some(mut g) = self.touch else { return };
+        if g.window != id || g.device != device {
+            return;
+        }
+        let last = g.last;
+        g.last = at;
+        if g.stage == TouchStage::Pending && g.dragged(at) {
+            g.stage = TouchStage::Left;
+            self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: g.from.into() });
+            self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Pressed, button: MouseButton::Left });
+        }
+        self.touch = Some(g);
+        match g.stage {
+            TouchStage::Pending => self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: at.into() }),
+            TouchStage::Left if self.lock.is_some() => self.held_motion((at.0 - last.0, at.1 - last.1)),
+            _ => self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: at.into() }),
+        }
+    }
+
+    /// A short tap presses and releases on the way up. A cancelled undecided gesture does nothing; a committed drag
+    /// always releases, even when the system cancels it.
+    fn touch_end(&mut self, el: &ActiveEventLoop, id: WindowId, device: DeviceId, cancelled: bool) {
+        let Some(g) = self.touch.take() else { return };
+        if g.window != id || g.device != device {
+            self.touch = Some(g);
+            return;
+        }
+        match g.stage {
+            TouchStage::Pending if !cancelled => {
+                self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: g.from.into() });
+                self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Pressed, button: MouseButton::Left });
+                self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Released, button: MouseButton::Left });
+            }
+            TouchStage::Pending => {}
+            _ => {
                 if self.lock.is_none() {
-                    self.window_event(el, id, moved);
+                    self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: g.last.into() });
                 }
-                self.window_event(el, id, button(ElementState::Released));
+                let button = if g.stage == TouchStage::Right { MouseButton::Right } else { MouseButton::Left };
+                self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Released, button });
             }
         }
+    }
+
+    /// The detached surface for a native window, or `None` for the main window.
+    #[allow(dead_code)] // Used by feature branches that route gestures directly to an app surface.
+    fn touch_surface(&self, id: WindowId) -> Option<app::Win> {
+        self.detached_of(id).map(|i| self.detached[i].win)
+    }
+
+    /// Logical app coordinates of a physical touch point in its native window.
+    #[allow(dead_code)] // Used by multi-finger feature branches.
+    fn touch_point(&self, id: WindowId, at: (f64, f64)) -> Option<(f32, f32)> {
+        if let Some(i) = self.detached_of(id) {
+            let k = ui_scale(&self.detached[i].window);
+            return Some(((at.0 / k) as f32, (at.1 / k) as f32));
+        }
+        let window = self.window.as_ref()?;
+        Some(self.to_app(window, at.0, at.1))
     }
 
     /// Holds the cursor for a drag that moves a value rather than the cursor (knobs, scroll-bar right-drags): hidden,
@@ -776,9 +852,23 @@ impl ApplicationHandler for Shell {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            self.pointer = Some((id, (position.x, position.y)));
+        }
         if let WindowEvent::Touch(touch) = event {
             return self.touch_event(el, id, touch);
         }
+        #[cfg(target_os = "linux")]
+        if self.stylus_event(el, id, &event) {
+            return;
+        }
+        self.mouse_event(el, id, event);
+    }
+}
+
+impl Shell {
+    /// Mouse and synthetic touch-button handling. Touch gestures never re-enter here for recognition.
+    fn mouse_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         // A detached window's native window: its own handling, but for its keys, which go where the main window's do.
         let det = self.detached_of(id);
         self.key_on = det.map(|i| self.detached[i].win);
@@ -1943,6 +2033,9 @@ pub fn run() {
         detached: Vec::new(),
         key_on: None,
         touch: None,
+        pointer: None,
+        #[cfg(target_os = "linux")]
+        kde: Kde::default(),
     };
     #[cfg(unix)]
     stop_signal::install();
