@@ -123,7 +123,7 @@ struct Shell {
     detached: Vec<detached_win::DetWin>,
     /// The key event being handled came to this detached window: it goes to the app on that window's surface.
     key_on: Option<app::Win>,
-    /// The undecided or active touch/stylus gesture (`touch_event`). Ordinary mouse input does not use it.
+    /// The undecided or active touch/stylus pan gesture (`touch_event`). Ordinary mouse input does not use it.
     touch: Option<TouchGesture>,
     /// The last pointer position in each window, for an X11 stylus that arrives as mouse events.
     pointer: Option<(WindowId, (f64, f64))>,
@@ -396,9 +396,9 @@ impl Shell {
         self.pending = true;
     }
 
-    /// The first touch or stylus is undecided until it moves: a short tap is a left click, a move past the slop starts
-    /// the ordinary left drag. The left press is held back until then. Feature branches extend the undecided move and
-    /// release decisions without duplicating event identity, coordinates or stylus routing.
+    /// The first touch or stylus is undecided until it moves: a short tap is a left click, a move past the slop either
+    /// pans the view under it or starts the ordinary left drag. Other fingers do nothing. The left press is held back
+    /// until the choice is made, so a pan does not first place a clip or note or trigger a control.
     fn touch_event(&mut self, el: &ActiveEventLoop, id: WindowId, touch: Touch) {
         let Touch { device_id, phase, location, id: finger, .. } = touch;
         let at = (location.x, location.y);
@@ -407,6 +407,8 @@ impl Shell {
                 if self.touch.is_some() {
                     return;
                 }
+                let on = self.touch_surface(id);
+                self.app.on(on, |a| a.touch_start());
                 self.touch = Some(TouchGesture { window: id, device: device_id, finger, from: at, last: at, at: Instant::now(), stage: TouchStage::Pending, mouse: false });
                 self.mouse_event(el, id, WindowEvent::CursorMoved { device_id, position: location });
             }
@@ -431,6 +433,8 @@ impl Shell {
                     return false;
                 }
                 let Some((_, at)) = self.pointer.filter(|(window, _)| *window == id) else { return false };
+                let on = self.touch_surface(id);
+                self.app.on(on, |a| a.touch_start());
                 self.touch = Some(TouchGesture { window: id, device: *device_id, finger: 0, from: at, last: at, at: Instant::now(), stage: TouchStage::Pending, mouse: true });
                 true
             }
@@ -444,8 +448,8 @@ impl Shell {
         }
     }
 
-    /// A move while undecided keeps hovering; past the slop it starts the left drag. A committed drag moves by absolute
-    /// touch positions, or by deltas while a knob or scroll bar holds the cursor (`lock`).
+    /// A move while undecided keeps hovering; past the slop it pans or starts the left drag. A committed drag moves by
+    /// absolute touch positions, or by deltas while a knob or scroll bar holds the cursor (`lock`).
     fn touch_move(&mut self, el: &ActiveEventLoop, id: WindowId, device: DeviceId, at: (f64, f64)) {
         let Some(mut g) = self.touch else { return };
         if g.window != id || g.device != device {
@@ -454,9 +458,15 @@ impl Shell {
         let last = g.last;
         g.last = at;
         if g.stage == TouchStage::Pending && g.dragged(at) {
-            g.stage = TouchStage::Left;
             self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: g.from.into() });
-            self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Pressed, button: MouseButton::Left });
+            let on = self.touch_surface(id);
+            let delta = ((at.0 - g.from.0) as f32, (at.1 - g.from.1) as f32);
+            if self.app.on(on, |a| a.touch_pan(delta)) {
+                g.stage = TouchStage::Pan;
+            } else {
+                g.stage = TouchStage::Left;
+                self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Pressed, button: MouseButton::Left });
+            }
         }
         self.touch = Some(g);
         match g.stage {
@@ -466,8 +476,8 @@ impl Shell {
         }
     }
 
-    /// A short tap presses and releases on the way up. A cancelled undecided gesture does nothing; a committed drag
-    /// always releases, even when the system cancels it.
+    /// A short tap presses and releases on the way up. A cancelled undecided gesture does nothing; a committed left drag
+    /// always releases, even when the system cancels it. A cancelled pan stops without a release or momentum.
     fn touch_end(&mut self, el: &ActiveEventLoop, id: WindowId, device: DeviceId, cancelled: bool) {
         let Some(g) = self.touch.take() else { return };
         if g.window != id || g.device != device {
@@ -481,6 +491,10 @@ impl Shell {
                 self.mouse_event(el, id, WindowEvent::MouseInput { device_id: device, state: ElementState::Released, button: MouseButton::Left });
             }
             TouchStage::Pending => {}
+            TouchStage::Pan if cancelled => {
+                let on = self.touch_surface(id);
+                self.app.on(on, |a| a.touch_pan_cancel());
+            }
             _ => {
                 if self.lock.is_none() {
                     self.mouse_event(el, id, WindowEvent::CursorMoved { device_id: device, position: g.last.into() });
@@ -500,7 +514,6 @@ impl Shell {
     }
 
     /// The detached surface for a native window, or `None` for the main window.
-    #[allow(dead_code)] // Used by feature branches that route gestures directly to an app surface.
     fn touch_surface(&self, id: WindowId) -> Option<app::Win> {
         self.detached_of(id).map(|i| self.detached[i].win)
     }
